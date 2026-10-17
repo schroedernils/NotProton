@@ -67,10 +67,17 @@ int np_hooks_install_steamui(const struct mach_header_64 *mh, intptr_t slide,
 // NOTPROTON_DISABLE uses this to skip named hooks.
 int np_hooks_env_lists_label(const char *var, const char *label);
 
+// Whether a hook touches fields whose runtime layout must pass its probe.
+int np_hooks_layout_allowed(const char *label, int tool_layout_ok,
+                            int enabled_layout_ok);
+
 void np_hooks_launch_install(const struct mach_header_64 *mh, intptr_t slide);
 
 // Resolved from libc rather than the signature database, and installed before the client
 // can spawn anything, so this one does not wait for steamclient the way the rest do.
 void np_hooks_spawn_install(void);
+
+// Installs NSWorkspace native app presentation routing (no-op for unverified targets).
+void np_hooks_native_install(void);
 
 #endif // NOTPROTON_HOOKS_HOOKS_H

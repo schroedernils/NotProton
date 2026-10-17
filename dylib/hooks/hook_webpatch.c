@@ -5,11 +5,14 @@
 #include "../feats/webpatch.h"
 #include "../feats/compat.h"
 #include "../feats/compatsvc.h"
+#include "../feats/nativeplatform.h"
 #include "../util/file.h"
 #include "../util/log.h"
+#include "webpatch_cache.h"
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -41,110 +44,80 @@ _Pragma("clang diagnostic pop")
 
 #define WEBPATCH_MAX_CHUNK (32 * 1024 * 1024)
 
-static char *drain_fd(int fd, size_t *out_len) {
-    struct stat st;
-    if (fstat(fd, &st) != 0)
-        return NULL;
-    if (st.st_size <= 0 || st.st_size > WEBPATCH_MAX_CHUNK)
-        return NULL;
+static pthread_once_t transform_lock_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t transform_lock;
+static int transform_lock_status;
 
-    size_t total = (size_t)st.st_size;
-    char *buf = malloc(total);
-    if (!buf)
-        return NULL;
-
-    for (size_t done = 0; done < total; ) {
-        ssize_t n = read(fd, buf + done, total - done);
-        if (n <= 0) {
-            free(buf);
-            return NULL;
-        }
-        done += (size_t)n;
-    }
-    *out_len = total;
-    return buf;
+static void init_transform_lock(void) {
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0) { transform_lock_status = -1; return; }
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0 ||
+        pthread_mutex_init(&transform_lock, &attr) != 0)
+        transform_lock_status = -1;
+    pthread_mutexattr_destroy(&attr);
 }
 
-static int spill_to_temp(const char *bytes, size_t len) {
-    const char *home = np_home_dir();
-    if (!home)
-        return -1;
-
-    char dir[1024];
-    np_support_path(dir, sizeof(dir), home, NULL);
-    mkdir(dir, 0755);
-
-    char tmpl[1100];
-    snprintf(tmpl, sizeof(tmpl), "%s/webpatch.XXXXXX", dir);
-    int fd = mkstemp(tmpl);
-    if (fd < 0)
-        return -1;
-    unlink(tmpl);
-
-    for (size_t done = 0; done < len; ) {
-        ssize_t n = write(fd, bytes + done, len - done);
-        if (n <= 0) {
-            close(fd);
-            return -1;
-        }
-        done += (size_t)n;
-    }
-
-    if (lseek(fd, 0, SEEK_SET) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-// Read `path`, apply the compat gates, and return a rewound anonymous fd holding
-// the patched bytes. -1 falls the caller through to the real file, which happens
-// when the read fails or the gates are absent/missing. Safety.
-static int open_patched(const char *path) {
-    np_log_attach();
-
-    int in = sys_open(path, O_RDONLY, 0);
-    if (in < 0)
-        return -1;
-
-    size_t raw_len = 0;
-    char *raw = drain_fd(in, &raw_len);
-    if (!raw) {
-        struct stat st;
-        if (fstat(in, &st) == 0 && st.st_size > WEBPATCH_MAX_CHUNK)
-            NP_ERR("webpatch: %s holds %lld bytes, past the %d byte ceiling, so the "
-                   "compat UI stays unpatched", path, (long long)st.st_size,
-                   WEBPATCH_MAX_CHUNK);
-        close(in);
-        return -1;
-    }
-    close(in);
-
-    np_webpatch_set_fallback_tool(np_compat_fallback_tool_name());
+typedef struct {
+    uint64_t generation;
     const char *fex[NP_WEBPATCH_FEX_TOOLS_MAX];
-    np_webpatch_set_fex_tools(fex, np_compat_fex_tools(fex, NP_WEBPATCH_FEX_TOOLS_MAX));
-    size_t patched_len = 0;
-    const char *shape = NULL;
-    char *patched = np_webpatch_transform((const uint8_t *)raw, raw_len, &patched_len,
-                                          &shape);
-    free(raw);
-    if (!patched)
-        return -1;
+    size_t fex_count;
+} transform_context;
 
-    // Only this page pays for an unregistered service, and only here is it known that the
-    // page arrived. UNTRIED is not a miss: the chunk can precede the first route lookup.
+static char *transform_for_cache(const unsigned char *raw, size_t raw_len,
+                                 const char *fallback, size_t *patched_len,
+                                 int *cache_negative,
+                                 void *context) {
+    const transform_context *input = context;
+    uint64_t expected_generation = input->generation;
+    if (np_nativeplatform_generation() != expected_generation) {
+        *cache_negative = 0;
+        return NULL;
+    }
+    pthread_once(&transform_lock_once, init_transform_lock);
+    if (transform_lock_status || pthread_mutex_lock(&transform_lock) != 0) {
+        *cache_negative = 0;
+        return NULL;
+    }
+    np_webpatch_set_fallback_tool(fallback);
+    np_webpatch_set_fex_tools(input->fex, input->fex_count);
+    const char *shape = NULL;
+    char *patched = np_webpatch_transform(raw, raw_len, patched_len, &shape);
+    pthread_mutex_unlock(&transform_lock);
+    *cache_negative = !patched && shape == NULL;
+    if (np_nativeplatform_generation() != expected_generation) {
+        free(patched);
+        patched = NULL;
+        *cache_negative = 0;
+    }
     if (shape && strcmp(shape, NP_SHAPE_SELECTTOOL) == 0 &&
         np_compatsvc_routes() == NP_COMPATSVC_ABSENT)
         NP_ERR("webpatch: the compat page sources its tools from CompatManager and this "
                "client cannot answer, so the list will be empty");
+    return patched;
+}
 
-    int fd = spill_to_temp(patched, patched_len);
-    free(patched);
-    if (fd < 0) {
-        NP_ERR("webpatch: patched %s but staging the bytes failed, so the client reads "
-               "the chunk Valve shipped", path);
-        return -1;
+static int cache_source_open(const char *path, int flags) {
+    return sys_open(path, flags, 0);
+}
+
+static int open_patched(const char *path, int flags) {
+    np_log_attach();
+    transform_context context = { .generation = np_nativeplatform_generation() };
+    context.fex_count = np_compat_fex_tools(context.fex, NP_WEBPATCH_FEX_TOOLS_MAX);
+    // Tool capability changes invalidate cached UI, just like platform metadata.
+    char generation_key[32 + NP_WEBPATCH_FEX_TOOLS_MAX * 130];
+    size_t used = (size_t)snprintf(generation_key, sizeof(generation_key), "%llu",
+                                 (unsigned long long)context.generation);
+    for (size_t i = 0; i < context.fex_count; ++i) {
+        int n = snprintf(generation_key + used, sizeof(generation_key) - used, "|%s", context.fex[i]);
+        if (n < 0 || (size_t)n >= sizeof(generation_key) - used) return -1;
+        used += (size_t)n;
     }
+    int fd = np_webpatch_cache_open(path, flags, np_compat_fallback_tool_name(), generation_key,
+                                    cache_source_open,
+                                    transform_for_cache, &context,
+                                    WEBPATCH_MAX_CHUNK);
+    if (fd < 0) return -1;
 
     NP_LOG_FIRST("webpatch: served patched compat chunk (%s) to %s pid %d",
                  path, getprogname(), getpid());
@@ -158,7 +131,7 @@ static int try_serve(const char *path, int oflag) {
         return -1;
     if (!np_webpatch_should_patch(path))
         return -1;
-    return open_patched(path);
+    return open_patched(path, oflag);
 }
 
 static mode_t creat_mode(int oflag, va_list ap) {

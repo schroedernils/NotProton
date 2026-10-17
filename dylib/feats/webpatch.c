@@ -1,5 +1,7 @@
 // Enables Steam Play in the UI/enables the Compatibility tab in game properties
 #include "webpatch.h"
+#include "nativeplatform.h"
+#include "library_filter.h"
 #include "../util/log.h"
 
 #include <stdlib.h>
@@ -91,6 +93,9 @@ static const char *marker_text(char c) {
 
 static size_t match_at(const char *src, size_t len, size_t pos,
                        const char *find, np_cap_t *caps) {
+    unsigned char first = (unsigned char)find[0];
+    if (first && cap_index(first) < 0 && first != NP_FALLBACK_TOOL[0] &&
+        (pos >= len || (unsigned char)src[pos] != first)) return 0;
     for (int i = 0; i < NP_CAP_MAX; i++) { caps[i].at = NULL; caps[i].len = 0; }
 
     if (cap_index((unsigned char)find[0]) >= 0 && pos &&
@@ -132,7 +137,14 @@ static size_t match_at(const char *src, size_t len, size_t pos,
 static size_t count_matches(const char *src, size_t len, const char *find) {
     np_cap_t caps[NP_CAP_MAX];
     size_t n = 0;
+    unsigned char first = (unsigned char)find[0];
+    int literal = first && cap_index(first) < 0 && first != NP_FALLBACK_TOOL[0];
     for (size_t i = 0; i < len; ) {
+        if (literal) {
+            const char *candidate = memchr(src + i, first, len - i);
+            if (!candidate) break;
+            i = (size_t)(candidate - src);
+        }
         size_t used = match_at(src, len, i, find, caps);
         if (used) { n++; i += used; } else i++;
     }
@@ -312,7 +324,44 @@ static int out_expand(np_out_t *o, const char *replace, const np_cap_t *caps) {
     "(0," RT ".jsx)(" BARREL ".XY,{label:npL(\"Controllers (May break Steam Input. Not recommended)\"," \
     "\"控制器（可能导致 Steam Input 失效，不推荐）\"),children:" \
     "T([\"NOTPROTON_RAW_CONTROLLERS\"],npL(\"Let games read controllers directly\"," \
-    "\"允许游戏直接读取控制器\"),\"1\",\"\")},\"ctl\")" \
+    "\"允许游戏直接读取控制器\"),\"1\",\"\")},\"ctl\")," \
+    "(0," RT ".jsxs)(" BARREL ".XY,{label:npL(\"Steam overlay and fullscreen\",\"Steam 叠加层与全屏\"),children:[" \
+    "T([\"SteamDisableOverlayDPIScaling\"],npL(\"Keep overlay size fixed\",\"保持叠加层大小固定\"),\"1\")," \
+    "T([\"NOTPROTON_DISABLE_OVERLAY\"],npL(\"Disable overlay for this game\",\"对此游戏关闭叠加层\"),\"1\")," \
+    "T([\"NOTPROTON_GAME_MODE\"],\"Disable macOS Game Mode for this game\",\"0\",\"1\")," \
+    "T([\"NOTPROTON_CONSOLE_MODE\"],\"TV mode: fullscreen and return to Big Picture (experimental)\",\"1\",\"0\")," \
+    "T([\"NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN\"],npL(\"Release displays in fullscreen (experimental)\",\"全屏时释放显示器（实验性）\"),\"1\",\"0\")" \
+    "]},\"overlay\")," \
+    "(0," RT ".jsxs)(" BARREL ".XY,{label:npL(\"Game launcher\",\"游戏启动器\"),children:[" \
+    "(0," RT ".jsx)(\"button\",{type:\"button\",className:\"MSCXRow\"," \
+    "disabled:!SteamClient.System?.OpenFileDialog,onClick:async()=>{try{" \
+    "const f=await SteamClient.System.OpenFileDialog({strTitle:npL(\"Choose game or mod launcher\",\"选择游戏或模组启动器\")," \
+    "strInitialFile:g(\"NOTPROTON_LAUNCH_TARGET\")==\"default\"?\"\":g(\"NOTPROTON_LAUNCH_TARGET\")," \
+    "rgFilters:[{strFileTypeName:\"Windows (*.exe,*.bat,*.cmd)\",rFilePatterns:[\"*.exe\",\"*.bat\",\"*.cmd\"],bUseAsDefault:true}]});" \
+    "if(typeof f===\"string\"&&f.startsWith(\"/\")&&!/[\\r\\n\\0]/.test(f)&&/\\.(exe|bat|cmd)$/i.test(f))" \
+    "s([[\"NOTPROTON_LAUNCH_TARGET\",f]]);" \
+    "}catch(e){console.warn(\"NotProton: launcher selection cancelled or unavailable\")}}," \
+    "children:npL(\"Choose game or mod launcher…\",\"选择游戏或模组启动器…\")})," \
+    "(0," RT ".jsx)(\"button\",{type:\"button\",className:\"MSCXRow\"," \
+    "onClick:()=>s([[\"NOTPROTON_LAUNCH_TARGET\",\"default\"]])," \
+    "children:npL(\"Use Steam's default launcher\",\"使用 Steam 默认启动器\")})" \
+    "]},\"launcher\")," \
+    "(0," RT ".jsx)(\"button\",{type:\"button\",className:\"MSCXRow\"," \
+    "onClick:()=>s([\"CX_GRAPHICS_BACKEND\",\"D3DM_ENABLE_METALFX\",\"DXMT_ENABLE_NVEXT\"," \
+    "\"DXMT_METALFX_SPATIAL_SWAPCHAIN\",\"MTL_HUD_ENABLED\",\"ROSETTA_ADVERTISE_AVX\"," \
+    "\"WINEMSYNC\",\"NOTPROTON_RETINA\"].map(k=>[k,\"\"]).concat([[\"DXMT_CONFIG\",fx(\"\")]]))," \
+    "children:npL(\"Reset graphics to defaults\",\"重置图形默认设置\")},\"reset-gfx\")," \
+    "(0," RT ".jsx)(\"button\",{type:\"button\",className:\"MSCXRow\"," \
+    "disabled:!Number.isInteger(t.unAppID)||t.unAppID<=0||t.unAppID>4294967295||" \
+    "!SteamClient.System?.OpenInSystemBrowser,onClick:()=>{" \
+    "if(Number.isInteger(t.unAppID)&&t.unAppID>0&&t.unAppID<=4294967295&&" \
+    "SteamClient.System?.OpenInSystemBrowser)SteamClient.System.OpenInSystemBrowser(" \
+    "\"notproton://prefix/rebuild?appid=\"+t.unAppID)},children:npL(\"Review game environment repair…\"," \
+    "\"检查游戏环境修复…\")},\"rebuild\")," \
+    "(0," RT ".jsx)(\"button\",{type:\"button\",className:\"MSCXRow\"," \
+    "disabled:!Number.isInteger(t.unAppID)||t.unAppID<=0||t.unAppID>4294967295||!SteamClient.System?.OpenInSystemBrowser," \
+    "onClick:()=>{if(Number.isInteger(t.unAppID)&&t.unAppID>0&&t.unAppID<=4294967295&&SteamClient.System?.OpenInSystemBrowser)" \
+    "SteamClient.System.OpenInSystemBrowser(\"notproton://game/support?appid=\"+t.unAppID)},children:\"Launch help and saved games…\"},\"support\")" \
     "]})})}"
 
 #define NP_CX_OPTIONS_CAPTURE(RT, BARREL) \
@@ -427,7 +476,7 @@ static const np_gate_t g_gates_selecttool[] = {
       ".data?.tools?.length)return null;",
       "[" NP_C1 "," NP_C2 "]=(typeof MSCXToolQuery==\"function\"?MSCXToolQuery:r=>r)"
       "((0," NP_C3 ".cT)(" NP_C4 ")," NP_C4 ");if(" NP_C1
-      ".isLoading||!" NP_C1 ".data?.tools?.length)return null;", 1, 1 },
+      ".isLoading||!" NP_C1 ".data?.tools?.length)return null;", 1, 1, 0 },
     { "get is_invalid_os_type(){return this.most_available_per_client_data.is_invalid_os_type}",
       "get is_invalid_os_type(){return false}", 1, 0 },
     // Reminder banner for 32 bit Mac games
@@ -466,8 +515,83 @@ static const np_gate_t g_fixes[] = {
       1, 0 },
     { "this.m_bServicesInitialized=!0,SteamClient.UI.NotifyAppInitialized()",
       "this.m_bServicesInitialized=!0," NP_LAUNCH_MIGRATION ",SteamClient.UI.NotifyAppInitialized()", 1, 0 },
+    // In Steam's platform module, Pr means macOS and td means Windows.
+    // Compatibility availability includes Wine games, so the Apple filter needs
+    // common/oslist instead. Preserve the original predicate on other platforms.
+    { "case " NP_C1 "." NP_C2 ":return!!(0," NP_C3 ".td)()||" NP_C4
+      ".is_available_on_current_platform&&!" NP_C4 ".is_invalid_os_type;",
+      "case " NP_C1 "." NP_C2 ":return(0," NP_C3 ".Pr)()?!!(window.__NOTPROTON_NATIVE_PLATFORM__&&"
+      "window.__NOTPROTON_NATIVE_PLATFORM__.known.has(" NP_C4 ".appid)&&"
+      "(typeof npMode!==\"undefined\"&&npMode===\"windows\"?"
+      "window.__NOTPROTON_NATIVE_PLATFORM__.windows.has(" NP_C4 ".appid)&&"
+      "!window.__NOTPROTON_NATIVE_PLATFORM__.mac.has(" NP_C4 ".appid):"
+      "window.__NOTPROTON_NATIVE_PLATFORM__.mac.has(" NP_C4 ".appid))):"
+      "!!(0," NP_C3 ".td)()||" NP_C4 ".is_available_on_current_platform&&!"
+      NP_C4 ".is_invalid_os_type;", 1, 0 },
+    // Steam's newer bundled UI adds a Linux gaming-device branch.
+    { "case " NP_C1 "." NP_C2 ":return(0," NP_C3 ".CI)()&&!(0," NP_C3 ".mP)()?"
+      NP_C4 "(" NP_C5 "):(0," NP_C3 ".td)()?!0:" NP_C5
+      ".is_available_on_current_platform&&!" NP_C5 ".is_invalid_os_type;",
+      "case " NP_C1 "." NP_C2 ":return(0," NP_C3 ".Pr)()?!!(window.__NOTPROTON_NATIVE_PLATFORM__&&"
+      "window.__NOTPROTON_NATIVE_PLATFORM__.known.has(" NP_C5 ".appid)&&"
+      "(typeof npMode!==\"undefined\"&&npMode===\"windows\"?"
+      "window.__NOTPROTON_NATIVE_PLATFORM__.windows.has(" NP_C5 ".appid)&&"
+      "!window.__NOTPROTON_NATIVE_PLATFORM__.mac.has(" NP_C5 ".appid):"
+      "window.__NOTPROTON_NATIVE_PLATFORM__.mac.has(" NP_C5 ".appid))):"
+      "(0," NP_C3 ".CI)()&&!(0," NP_C3 ".mP)()?" NP_C4 "(" NP_C5 "):(0,"
+      NP_C3 ".td)()?!0:" NP_C5 ".is_available_on_current_platform&&!"
+      NP_C5 ".is_invalid_os_type;", 1, 0 },
 };
 #define NP_FIX_COUNT (sizeof(g_fixes) / sizeof(g_fixes[0]))
+#define NP_NATIVE_MAC_FILTER_FIX (NP_FIX_COUNT - 2)
+#define NP_UPDATED_NATIVE_MAC_FILTER_FIX (NP_FIX_COUNT - 1)
+
+// These anchors form one feature: never install a partial model/UI update.
+static const np_gate_t g_library_filters[] = {
+    { "function Y(e){return t=>{", "function Y(e,npMode){return t=>{", 1, 0 },
+    { "q(t[T.W6],Y(e))", "q(t[T.W6],Y(e,this.m_filterSpec.notprotonPlatform))", 2, 0 },
+    { "this.m_filterSpec={nFormatVersion:2,strSearchText:e&&e.strSearchText||\"\",filterGroups:",
+      "this.m_filterSpec={nFormatVersion:2,strSearchText:e&&e.strSearchText||\"\","
+      "notprotonPlatform:e?.notprotonPlatform===\"windows\"?\"windows\":\"native\",filterGroups:", 1, 0 },
+    { "SelectOption(e,t,r){let i=this.m_filterSpec.filterGroups[e].rgOptions;",
+      "SelectOption(e,t,r,npMode){if(npMode===\"native\"||npMode===\"windows\")"
+      "this.m_filterSpec.notprotonPlatform=npMode;let i=this.m_filterSpec.filterGroups[e].rgOptions;", 1, 0 },
+    { "SelectCollectionsAppFilterOption(e,t,r){this.m_collectionsAppFilter.SelectOption(e,t,r),this.SaveLocalState()}",
+      "SelectCollectionsAppFilterOption(e,t,r,npMode){this.m_collectionsAppFilter.SelectOption(e,t,r,npMode),this.SaveLocalState()}", 1, 0 },
+    { "if((0,B.Pr)())return(0,m.we)(\"#FilterElement_ValidPlatform_MacOS\")",
+      "if((0,B.Pr)())return this.m_filterSpec.notprotonPlatform===\"windows\"?"
+      "\"Windows (NotProton/CrossOver)\":(0,m.we)(\"#FilterElement_ValidPlatform_MacOS\")", 1, 0 },
+    { "R&&(0,i.jsxs)(ye.he,{direction:\"top\",nDelayShowMS:240,toolTipContent:T?\"#GameList_View_Platform_Linux\":\"#GameList_View_Platform_Apple\",className:(0,g.A)(An().CheckboxWithImage,M&&An().Disabled,j&&An().Active),onClick:()=>M||Bn(Vr.W6,Vr.Pu,!j),children:[T&&(0,i.jsx)(_.Wy0,{}),!T&&(0,i.jsx)(_.kPc,{})]})",
+      "R&&(0,i.jsx)(window.__NOTPROTON_LIBRARY_BUTTON__,{jsx:i.jsx,Tooltip:ye.he,Apple:_.kPc,Linux:_.Wy0,"
+      "linux:T,disabled:M,selected:j,mode:o.n6.currentAppFilter.m_filterSpec.notprotonPlatform,"
+      "className:(0,g.A)(An().CheckboxWithImage,M&&An().Disabled,j&&An().Active),"
+      "select:(active,mode)=>o.n6.SelectCollectionsAppFilterOption(Vr.W6,Vr.Pu,active,mode)})", 1, 0 },
+};
+#define NP_LIBRARY_FILTER_COUNT (sizeof(g_library_filters) / sizeof(g_library_filters[0]))
+
+// Steam build 1791918634 bundles the library into sp.js with different bindings.
+static const np_gate_t g_updated_library_filters[] = {
+    { "function Se(Ke){return we=>{", "function Se(Ke,npMode){return we=>{", 1, 0 },
+    { "$(Ae[L.W6],Se(we))", "$(Ae[L.W6],Se(we,this.m_filterSpec.notprotonPlatform))", 2, 0 },
+    { "this.m_filterSpec={nFormatVersion:ut,strSearchText:we&&we.strSearchText||\"\",filterGroups:",
+      "this.m_filterSpec={nFormatVersion:ut,strSearchText:we&&we.strSearchText||\"\","
+      "notprotonPlatform:we?.notprotonPlatform===\"windows\"?\"windows\":\"native\",filterGroups:", 1, 0 },
+    { "SelectOption(we,Ae,Ne){let le=this.m_filterSpec.filterGroups[we].rgOptions;",
+      "SelectOption(we,Ae,Ne,npMode){if(npMode===\"native\"||npMode===\"windows\")"
+      "this.m_filterSpec.notprotonPlatform=npMode;let le=this.m_filterSpec.filterGroups[we].rgOptions;", 1, 0 },
+    { "SelectCollectionsAppFilterOption(V,ee,De){this.m_collectionsAppFilter.SelectOption(V,ee,De),this.SaveLocalState()}",
+      "SelectCollectionsAppFilterOption(V,ee,De,npMode){this.m_collectionsAppFilter.SelectOption(V,ee,De,npMode),this.SaveLocalState()}", 1, 0 },
+    { "if((0,P.Pr)())return(0,l.we)(\"#FilterElement_ValidPlatform_MacOS\")",
+      "if((0,P.Pr)())return this.m_filterSpec.notprotonPlatform===\"windows\"?"
+      "\"Windows (NotProton/CrossOver)\":(0,l.we)(\"#FilterElement_ValidPlatform_MacOS\")", 1, 0 },
+    { "Ua&&(0,e.jsxs)(st.he,{direction:\"top\",nDelayShowMS:240,toolTipContent:ka?\"#GameList_View_Platform_Linux\":\"#GameList_View_Platform_Apple\",className:(0,p.A)(go().CheckboxWithImage,ha&&go().Disabled,Io&&go().Active),onClick:()=>ha||y1(as.W6,as.Pu,!Io),children:[ka&&(0,e.jsx)(y.Wy0,{}),!ka&&(0,e.jsx)(y.kPc,{})]})",
+      "Ua&&(0,e.jsx)(window.__NOTPROTON_LIBRARY_BUTTON__,{jsx:e.jsx,Tooltip:st.he,Apple:y.kPc,Linux:y.Wy0,"
+      "linux:ka,disabled:ha,selected:Io,mode:r.n6.currentAppFilter.m_filterSpec.notprotonPlatform,"
+      "className:(0,p.A)(go().CheckboxWithImage,ha&&go().Disabled,Io&&go().Active),"
+      "select:(active,mode)=>r.n6.SelectCollectionsAppFilterOption(as.W6,as.Pu,active,mode)})", 1, 0 },
+};
+_Static_assert(sizeof(g_updated_library_filters) / sizeof(g_updated_library_filters[0]) ==
+               NP_LIBRARY_FILTER_COUNT, "library variants must have the same gates");
 
 typedef struct {
     const char     *name;
@@ -534,17 +658,30 @@ char *np_webpatch_transform(const uint8_t *src, size_t src_len, size_t *out_len,
     }
     int    fix_on[NP_FIX_COUNT];
     size_t fix_live = 0;
+    char *native_mac_js = NULL;
     for (size_t f = 0; f < NP_FIX_COUNT; f++) {
         size_t n = count_matches(s, src_len, g_fixes[f].find);
         fix_on[f] = n == (size_t)g_fixes[f].expect;
+        if ((f == NP_NATIVE_MAC_FILTER_FIX || f == NP_UPDATED_NATIVE_MAC_FILTER_FIX) && fix_on[f]) {
+            free(native_mac_js);
+            native_mac_js = np_nativeplatform_javascript(NULL);
+        }
         if (fix_on[f]) { fix_live++; continue; }
         if (n)
             NP_WARN("webpatch: fix %zu expected %d occurrence(s), found %zu; "
                     "leaving it alone", f, g_fixes[f].expect, n);
     }
+    const np_gate_t *library_gates = fix_on[NP_UPDATED_NATIVE_MAC_FILTER_FIX]
+                                  ? g_updated_library_filters : g_library_filters;
+    int library_filter = fix_on[NP_NATIVE_MAC_FILTER_FIX] || fix_on[NP_UPDATED_NATIVE_MAC_FILTER_FIX];
+    for (size_t g = 0; library_filter && g < NP_LIBRARY_FILTER_COUNT; g++)
+        library_filter = count_matches(s, src_len, library_gates[g].find) ==
+                         (size_t)library_gates[g].expect;
 
-    if (!shape && !fix_live)
+    if (!shape && !fix_live) {
+        free(native_mac_js);
         return NULL;   // Not the part carrying the compat UI.
+    }
 
     int    gate_on[NP_GATE_MAX] = {0};
     size_t gate_live = 0;
@@ -569,12 +706,22 @@ char *np_webpatch_transform(const uint8_t *src, size_t src_len, size_t *out_len,
         if (drifted) {
             NP_ERR("webpatch: [%s] compat UI left unpatched, a Steam update moved the "
                    "anchors", shape->name);
+            free(native_mac_js);
             return NULL;
         }
     }
 
     np_out_t out = {0};
     np_cap_t caps[NP_CAP_MAX];
+    if (native_mac_js && !out_put(&out, native_mac_js, strlen(native_mac_js))) {
+        free(native_mac_js);
+        return NULL;
+    }
+    free(native_mac_js);
+    if (library_filter && !out_put(&out, NP_LIBRARY_BUTTON_JS, sizeof(NP_LIBRARY_BUTTON_JS) - 1)) {
+        free(out.buf);
+        return NULL;
+    }
     for (size_t i = 0; i < src_len; ) {
         const np_gate_t *hit = NULL;
         size_t used = 0;
@@ -588,6 +735,10 @@ char *np_webpatch_transform(const uint8_t *src, size_t src_len, size_t *out_len,
             used = match_at(s, src_len, i, g_fixes[f].find, caps);
             if (used) { hit = &g_fixes[f]; break; }
         }
+        for (size_t g = 0; !hit && library_filter && g < NP_LIBRARY_FILTER_COUNT; g++) {
+            used = match_at(s, src_len, i, library_gates[g].find, caps);
+            if (used) { hit = &library_gates[g]; break; }
+        }
         int ok = hit ? out_expand(&out, hit->replace, caps)
                      : out_put(&out, s + i, 1);
         if (!ok) { free(out.buf); return NULL; }
@@ -597,6 +748,7 @@ char *np_webpatch_transform(const uint8_t *src, size_t src_len, size_t *out_len,
     if (!out_reserve(&out, 0)) { free(out.buf); return NULL; }
     out.buf[out.len] = '\0';
     *out_len = out.len;
+    if (library_filter) NP_LOG("webpatch: dual Apple library filter enabled");
     NP_LOG("webpatch: [%s] %zu gates, %zu fixes applied",
            shape ? shape->name : "no compat UI", gate_live, fix_live);
     return out.buf;

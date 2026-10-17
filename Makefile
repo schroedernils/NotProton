@@ -11,7 +11,7 @@ CFLAGS   := -arch $(ARCH) -mmacosx-version-min=$(MIN_VER) $(AVAIL) \
 LDFLAGS  := -arch $(ARCH) -mmacosx-version-min=$(MIN_VER) \
             -dynamiclib -install_name @rpath/notproton.dylib
 
-FRAMEWORKS := -framework CoreFoundation -framework CoreGraphics
+FRAMEWORKS := -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework Security
 
 DOBBY_DIR  := build/dobby
 DOBBY_LIBS := $(DOBBY_DIR)/libdobby.a \
@@ -38,12 +38,14 @@ SRCS := \
 	dylib/hooks/hook_shortcut_bundle.c \
 	dylib/hooks/hook_webui.c \
 	dylib/hooks/hook_webpatch.c \
+	dylib/hooks/webpatch_cache.c \
 	dylib/hooks/hook_spawn.c \
 	dylib/hooks/hook_launch.c \
 	dylib/feats/compat.c \
 	dylib/feats/webui.c \
 	dylib/feats/compatsvc.c \
 	dylib/feats/webpatch.c \
+	dylib/feats/nativeplatform.c \
 	dylib/feats/input_access.c \
 	vendor/cJSON.c
 
@@ -60,13 +62,14 @@ X86_STUB    := $(OUT_DIR)/notproton.x86_64.dylib
 TARGET      := $(OUT_DIR)/notproton.dylib
 
 OBJS := $(patsubst %.c,$(OUT_DIR)/%.o,$(SRCS))
+OBJS += $(OUT_DIR)/dylib/hooks/hook_native.o $(OUT_DIR)/dylib/hooks/native_presentation.o
 DEPS := $(OBJS:.o=.d)
 
 .PHONY: all clean rebuild dobby deploy dylib dylib-install sigcheck fonts fonts-install app-payload app app-zip \
         anchorcheck callscheck sigdb-fixtures webpatch-fixtures peicon-fixtures panel-behavior app-tests \
         tests-list overlay-shim overlay-shim-install overlay-shim-tests \
         overlay-shim-bench iconmaker icon \
-        appinfo helpers-install ntdll-resolve bridge runcheck compatcheck \
+        appinfo sessioncheck game-presentation helpers-install ntdll-resolve bridge runcheck compatcheck \
         compatsvc-check shortcutcheck scriptcheck envcheck buildcheck settingscheck routecheck bridgecheck gamedrivecheck launchercheck launch-shell FORCE
 
 APP_PAYLOAD := app/Sources/NotProtonApp/Resources/payload
@@ -257,9 +260,9 @@ peicon-fixtures:
 GATECHECK         := $(OUT_DIR)/gatecheck
 WEBPATCH_FIXTURES := dylib/tests/webpatch-fixtures
 
-$(GATECHECK): dylib/tests/gatecheck.c dylib/feats/webpatch.c dylib/feats/webpatch.h
+$(GATECHECK): dylib/feats/library_filter.h dylib/tests/gatecheck.c dylib/feats/webpatch.c dylib/feats/webpatch.h dylib/feats/nativeplatform.c dylib/feats/nativeplatform.h
 	@mkdir -p $(dir $@)
-	$(TEST_CC) -O1 -o $@ dylib/tests/gatecheck.c
+	$(TEST_CC) -O1 -pthread -o $@ dylib/tests/gatecheck.c dylib/feats/nativeplatform.c
 
 webpatch-fixtures:
 	@if [ ! -d $(WEBPATCH_FIXTURES) ] || [ ! -f dylib/tests/gatecheck.c ]; then \
@@ -341,7 +344,7 @@ panel-behavior:
 		echo "==> panel-behavior: node not found, skipped"; exit 0; fi; \
 	mkdir -p $(OUT_DIR) && \
 	$(TEST_CC) -O1 -o $(OUT_DIR)/panel-emit \
-	  $(PANEL_TESTS)/emit.c && \
+	  $(PANEL_TESTS)/emit.c dylib/feats/nativeplatform.c -pthread && \
 	node $(PANEL_TESTS)/behavior.js $(OUT_DIR)/panel-emit && \
 	node $(PANEL_TESTS)/switching.js $(OUT_DIR)/panel-emit && \
 	node $(PANEL_TESTS)/launch-options.js $(OUT_DIR)/panel-emit && \
@@ -381,6 +384,10 @@ $(OUT_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(OUT_DIR)/dylib/hooks/%.o: dylib/hooks/%.m
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fblocks -fobjc-arc -c $< -o $@
+
 $(RUN_SCRIPT_H): dylib/feats/compat_run.sh dylib/embed_script.py
 	@mkdir -p $(GENERATED_DIR)
 	python3 dylib/embed_script.py $< $@ RUN_SCRIPT
@@ -402,10 +409,25 @@ OVERLAY_SHIM_TEST_FLAGS := -mmacosx-version-min=$(MIN_VER) -O2 -Wall -Wextra \
 
 overlay-shim: $(OVERLAY_SHIM)
 
+GAME_IDENTITY := $(OUT_DIR)/game-identity.dylib
+.PHONY: game-identity
+game-identity: $(GAME_IDENTITY)
+
+$(GAME_IDENTITY): game-identity/game_identity.m game-identity/console_mode.m game-identity/console_mode.h overlay-shim/fullscreen_capture.m overlay-shim/fullscreen_capture.h
+	@mkdir -p $(OUT_DIR)
+	$(CC) -arch arm64 -mmacosx-version-min=$(MIN_VER) -dynamiclib -O2 -Wall -Wextra \
+		-framework AppKit -framework CoreServices -framework CoreGraphics -install_name @rpath/game-identity.dylib \
+		-o $(OUT_DIR)/game-identity.arm64.dylib game-identity/game_identity.m game-identity/console_mode.m overlay-shim/fullscreen_capture.m
+	$(CC) -arch x86_64 -mmacosx-version-min=$(MIN_VER) -dynamiclib -O2 -Wall -Wextra \
+		-framework AppKit -framework CoreServices -framework CoreGraphics -install_name @rpath/game-identity.dylib \
+		-o $(OUT_DIR)/game-identity.x86_64.dylib game-identity/game_identity.m game-identity/console_mode.m overlay-shim/fullscreen_capture.m
+	lipo -create $(OUT_DIR)/game-identity.arm64.dylib $(OUT_DIR)/game-identity.x86_64.dylib -output $@
+	codesign -fs - $@
+
 $(OVERLAY_SHIM): $(OVERLAY_SHIM_SRC)
 	@mkdir -p $(OUT_DIR)
-	$(CC) -arch arm64 $(OVERLAY_SHIM_FLAGS) -o $(OVERLAY_SHIM_ARM) $<
-	$(CC) -arch x86_64 $(OVERLAY_SHIM_FLAGS) -o $(OVERLAY_SHIM_X86) $<
+	$(CC) -arch arm64 $(OVERLAY_SHIM_FLAGS) -o $(OVERLAY_SHIM_ARM) $(OVERLAY_SHIM_SRC)
+	$(CC) -arch x86_64 $(OVERLAY_SHIM_FLAGS) -o $(OVERLAY_SHIM_X86) $(OVERLAY_SHIM_SRC)
 	lipo -create $(OVERLAY_SHIM_ARM) $(OVERLAY_SHIM_X86) -output $@
 	codesign -fs - $@
 	@lipo -info $@
@@ -477,10 +499,25 @@ $(APPINFO): helpers/appinfo.swift
 	swiftc -O -target $(ARCH)-apple-macos$(MIN_VER) -o $@ $<
 	@echo "==> Built $@"
 
-helpers-install: $(ICONMAKER) $(APPINFO)
+game-presentation:
+	@test -x helpers/game-presentation.sh || { echo "helpers/game-presentation.sh must be executable" >&2; exit 1; }
+
+SESSIONCHECK := $(OUT_DIR)/sessioncheck
+
+sessioncheck: $(SESSIONCHECK)
+
+$(SESSIONCHECK): helpers/sessioncheck.c
+	@mkdir -p $(OUT_DIR)
+	$(CC) -arch $(ARCH) -mmacosx-version-min=$(MIN_VER) -std=c17 -O2 \
+		-Wall -Wextra -Werror -o $@ $<
+	@echo "==> Built $@"
+
+helpers-install: $(ICONMAKER) $(APPINFO) $(SESSIONCHECK) game-presentation
 	$(call install_atomically,$(ICONMAKER),$(SUPPORT_DIR)/iconmaker)
 	$(call install_atomically,$(APPINFO),$(SUPPORT_DIR)/appinfo)
-	@echo "==> Installed: $(SUPPORT_DIR)/{iconmaker,appinfo}"
+	$(call install_atomically,$(SESSIONCHECK),$(SUPPORT_DIR)/sessioncheck)
+	$(call install_atomically,helpers/game-presentation.sh,$(SUPPORT_DIR)/game-presentation)
+	@echo "==> Installed: $(SUPPORT_DIR)/{iconmaker,appinfo,sessioncheck}"
 
 dobby:
 	@mkdir -p $(DOBBY_DIR)
@@ -551,13 +588,17 @@ bridge:
 fonts:
 	fonts/build.sh
 
-app-payload: $(TARGET) $(OVERLAY_SHIM) $(ICONMAKER) $(APPINFO)
+app-payload: $(TARGET) $(OVERLAY_SHIM) $(GAME_IDENTITY) $(ICONMAKER) $(APPINFO) $(SESSIONCHECK) game-presentation
 	@mkdir -p "$(APP_PAYLOAD)/signatures/macos.arm64"
 	@mkdir -p "$(APP_PAYLOAD)/bridge"
 	cp -f $(TARGET) "$(APP_PAYLOAD)/notproton.dylib"
 	cp -f $(OVERLAY_SHIM) "$(APP_PAYLOAD)/overlay-shim.dylib"
+	cp -f $(GAME_IDENTITY) "$(APP_PAYLOAD)/game-identity.dylib"
 	cp -f $(ICONMAKER) "$(APP_PAYLOAD)/iconmaker"
 	cp -f $(APPINFO) "$(APP_PAYLOAD)/appinfo"
+	cp -f helpers/game-presentation.sh "$(APP_PAYLOAD)/game-presentation"
+	chmod 755 "$(APP_PAYLOAD)/game-presentation"
+	cp -f $(SESSIONCHECK) "$(APP_PAYLOAD)/sessioncheck"
 	cp -f dylib/feats/compat_run.sh "$(APP_PAYLOAD)/run"
 	cp -f signatures/macos.arm64/*.json "$(APP_PAYLOAD)/signatures/macos.arm64/"
 	@set -e; for spec in $(BRIDGE_FILES); do \

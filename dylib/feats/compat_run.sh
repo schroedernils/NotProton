@@ -10,12 +10,6 @@ shift || true
 # and anything after %command% is a launch argument passed to the game.
 launch_args="$*"
 
-case "$verb" in
-  getcompatpath)
-    printf '%s\n' "$STEAM_COMPAT_DATA_PATH"
-    exit 0
-    ;;
-esac
 
 np_support="$HOME/Library/Application Support/notproton"
 iconmaker="$np_support/iconmaker"
@@ -186,12 +180,26 @@ fi
 
 # Keeps Wine from inheriting the prefix and template locks (fd 8 and 9).
 without_lock_fds() {
-  "$@" 8>&- 9>&-
+  "$@" 6>&- 8>&- 9>&-
 }
 
 # If two WINEDLLPATH directories have the same DLL, Wine uses the one listed first.
 export WINEDLLPATH="$CX_ROOT/lib/wine/x86_64-windows:$wine_unix${WINEDLLPATH:+:$WINEDLLPATH}"
 export PATH="$CX_ROOT/bin:$PATH"
+
+# Steam can offer Play before the previous launch finishes its idle grace period.
+# Keep the same lock until cleanup completes and let a quick restart wait for it.
+acquire_session_lock() {
+  /usr/bin/lockf -s -t 0 6 && return 0
+  echo "=== waiting for the previous prefix session to finish ===" >> "$log" 2>&1 || true
+  if /usr/bin/lockf -s -t 20 6; then
+    echo "=== previous prefix session finished, continuing launch ===" >> "$log" 2>&1 || true
+    return 0
+  fi
+  echo "=== prefix is still running after the restart wait ===" >> "$log" 2>&1 || true
+  show_alert "This game is still running" "The previous game session has not finished. Close the game and try again."
+  exit 1
+}
 
 if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
   log="$STEAM_COMPAT_DATA_PATH/notproton-run.log"
@@ -220,6 +228,38 @@ report_early_exit() {
   [ "$status" = 0 ] && return 0
   echo "=== aborted during $stage_step (exit $status) before launch ===" \
     >> "$log" 2>&1 || true
+  # Best-effort diagnostics handoff only; never change Steam's failure status.
+  # A subshell keeps trap-local validation out of the launch environment.
+  (
+    case "${stage_step:-}" in
+      'prefix session lock'|'prefix lock') exit 0 ;;
+    esac
+    case "${verb:-}" in
+      waitforexitandrun) ;;
+      run)
+        # run also serves install-script helpers. Require primary game identity.
+        [ "${SteamAppId:-}" = "${app_id:-}" ] &&
+          [ "${SteamGameId:-}" = "${app_id:-}" ] || exit 0
+        ;;
+      *) exit 0 ;;
+    esac
+    # Reject zero, leading zeros, signs, whitespace and overflow before arithmetic.
+    case "${app_id:-}" in ''|0*|*[!0-9]*) exit 0 ;; esac
+    [ "${#app_id}" -le 10 ] && [ "$app_id" -le 4294967295 ] || exit 0
+    # Never start a helper-target diagnostics loop, even with inherited game IDs.
+    np_failed_target=$(printf '%s' "${launch_args:-}" | tr '[:upper:]' '[:lower:]')
+    case "$np_failed_target" in
+      *iscriptevaluator*|*wineboot*|*winedevice*|*services.exe*|*explorer.exe*|*steam.exe*|*vc_redist*|*vcredist*|*dxsetup.exe*|*msiexec.exe*|*unitycrashhandler*) exit 0 ;;
+    esac
+    [ -n "${np_support:-}" ] && [ -r "$np_support/app-executable" ] || exit 0
+    IFS= read -r np_failed_app < "$np_support/app-executable" || exit 0
+    case "$np_failed_app" in /*/Contents/MacOS/*) ;; *) exit 0 ;; esac
+    [ -f "$np_failed_app" ] && [ -x "$np_failed_app" ] || exit 0
+    # Close launch locks; target this known app instead of a stale URL handler.
+    np_failed_bundle=${np_failed_app%/Contents/MacOS/*}
+    open -a "$np_failed_bundle" "notproton://game/support?appid=$app_id" \
+      6>&- 8>&- 9>&- >> "$log" 2>&1 || true
+  ) || true
 }
 trap report_early_exit EXIT
 
@@ -248,6 +288,101 @@ case "$verb" in
     ;;
 esac
 
+# Profiles are data, never shell code. Steam helper and game launches resolve the same owner.
+profile_root="$STEAM_COMPAT_DATA_PATH"
+# Steam may pass the owner returned by getcompatpath on the next invocation.
+if [ "$app_id" != 0 ] && [ "${profile_root##*/}" != "$app_id" ] && [ -d "${profile_root%/*}/$app_id" ]; then
+  profile_root="${profile_root%/*}/$app_id"
+fi
+profile_file="$profile_root/notproton-profile"
+profile_graphics=default
+profile_msync=default
+profile_retina=default
+profile_hide_tile=default
+profile_overlay_dpi=default
+profile_fullscreen_display_capture=default
+profile_game_mode=default
+profile_owner=""
+profile_target=""
+profile_cwd=""
+load_game_profile() {
+  [ ! -L "$profile_file" ] || return 1
+  [ -e "$profile_file" ] || return 0
+  [ -f "$profile_file" ] || return 1
+  [ "$(stat -f %z "$profile_file" 2>/dev/null || echo 99999)" -le 16384 ] || return 1
+  tab=$(printf '\t')
+  schema=""
+  seen_keys="|"
+  while IFS="$tab" read -r key value extra || [ -n "$key$value$extra" ]; do
+    [ -z "$extra" ] || return 1
+    case "$value" in *"$(printf '\r')"*) return 1 ;; esac
+    case "$seen_keys" in *"|$key|"*) return 1 ;; esac
+    seen_keys="$seen_keys$key|"
+    case "$key:$value" in
+      schema:1) schema=1 ;;
+      graphics:default|graphics:d3dmetal|graphics:dxvk|graphics:dxmt) profile_graphics="$value" ;;
+      msync:default|msync:0|msync:1) profile_msync="$value" ;;
+      retina:default|retina:0|retina:1) profile_retina="$value" ;;
+      hide_launcher_tile:default|hide_launcher_tile:0|hide_launcher_tile:1) profile_hide_tile="$value" ;;
+      game_mode:default|game_mode:0|game_mode:1) profile_game_mode="$value" ;;
+      overlay_dpi:default|overlay_dpi:disabled) profile_overlay_dpi="$value" ;;
+      fullscreen_display_capture:default|fullscreen_display_capture:released) profile_fullscreen_display_capture="$value" ;;
+      prefix_owner:*) case "$value" in *[!0-9]*) return 1 ;; esac; profile_owner="$value" ;;
+      launch_target:*) case "$value" in ''|/*) profile_target="$value" ;; *) return 1 ;; esac ;;
+      launch_cwd:*) case "$value" in ''|/*) profile_cwd="$value" ;; *) return 1 ;; esac ;;
+      *) return 1 ;;
+    esac
+  done < "$profile_file"
+  [ "$schema" = 1 ] || return 1
+  { [ -z "$profile_target" ] && [ -z "$profile_cwd" ]; } || { [ -n "$profile_target" ] && [ -n "$profile_cwd" ]; }
+}
+if ! load_game_profile; then
+  echo "=== malformed game profile, refusing launch ===" >> "$log" 2>&1 || true
+  exit 1
+fi
+if [ -n "$profile_owner" ] && [ "$profile_owner" != "$app_id" ]; then
+  owner_root="${profile_root%/*}/$profile_owner"
+  [ -d "$owner_root/pfx" ] && [ ! -L "$owner_root" ] && [ ! -L "$owner_root/pfx" ] || exit 1
+  [ -f "$owner_root/notproton-build" ] && [ ! -L "$owner_root/notproton-build" ] || exit 1
+  owner_build=$(sed -n '1p' "$owner_root/notproton-build")
+  [ "$owner_build" = "$np_build" ] || exit 1
+  owner_profile="$owner_root/notproton-profile"
+  [ ! -L "$owner_profile" ] || exit 1
+  if [ -r "$owner_profile" ] && [ ! -L "$owner_profile" ]; then
+    owner_owner=$(awk -F '\t' '$1=="prefix_owner" {print $2}' "$owner_profile")
+    [ -z "$owner_owner" ] || [ "$owner_owner" = "$profile_owner" ] || exit 1
+  fi
+  [ ! -f "$profile_root/notproton-build" ] || cmp -s "$profile_root/notproton-build" "$owner_root/notproton-build" || exit 1
+  export STEAM_COMPAT_DATA_PATH="$owner_root"
+  log="$profile_root/notproton-run.log"
+fi
+case "$verb" in
+  getcompatpath) printf '%s\n' "$STEAM_COMPAT_DATA_PATH"; exit 0 ;;
+esac
+if [ -z "$CX_GRAPHICS_BACKEND" ] && [ "$profile_graphics" != default ]; then
+  case "$profile_graphics" in
+    d3dmetal) backend_module="$CX_ROOT/lib64/apple_gptk/external/libd3dshared.dylib" ;;
+    dxvk|dxmt) backend_module="$CX_ROOT/lib/$profile_graphics/x86_64-windows/d3d11.dll" ;;
+  esac
+  [ -f "$backend_module" ] || { echo "=== selected graphics backend is unavailable ===" >> "$log"; exit 1; }
+  export CX_GRAPHICS_BACKEND="$profile_graphics"
+fi
+if [ -z "$WINEMSYNC" ] && [ "$profile_msync" != default ]; then export WINEMSYNC="$profile_msync"; fi
+if [ -z "$NOTPROTON_RETINA" ] && [ "$profile_retina" != default ]; then export NOTPROTON_RETINA="$profile_retina"; fi
+if [ -z "$NOTPROTON_HIDE_LAUNCHER_TILE" ] && [ "$profile_hide_tile" != default ]; then export NOTPROTON_HIDE_LAUNCHER_TILE="$profile_hide_tile"; fi
+if [ -z "$SteamDisableOverlayDPIScaling" ] && [ "$profile_overlay_dpi" = disabled ]; then
+  export SteamDisableOverlayDPIScaling=1
+fi
+if [ -z "$NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN" ] && [ "$profile_fullscreen_display_capture" = released ]; then
+  export NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN=1
+fi
+if [ -z "$NOTPROTON_GAME_MODE" ] && [ "$profile_game_mode" != default ]; then
+  export NOTPROTON_GAME_MODE="$profile_game_mode"
+fi
+if [ "$NOTPROTON_CONSOLE_MODE" = 1 ]; then
+  export NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN=1
+fi
+
 prefix_machine() {
   dll="$WINEPREFIX/drive_c/windows/system32/ntdll.dll"
   [ -f "$dll" ] || return 1
@@ -273,6 +408,21 @@ show_alert() {
 display alert "$1" message "$2" as critical
 APPLESCRIPT
 }
+
+# Call after launch options and profile settings have resolved CX_GRAPHICS_BACKEND.
+# D3DMetal is x86_64-only. The selected Wine directory is the runtime architecture
+# authority: FEX may still fall back to its Rosetta loader if the arm64 loader is absent.
+refuse_fex_d3dmetal() {
+  [ "$verb" != run ] || return 0
+  [ "${wine_unix##*/}" = aarch64-unix ] || return 0
+  [ "${CX_GRAPHICS_BACKEND:-}" = d3dmetal ] || return 0
+  echo "=== D3DMetal cannot run with the selected arm64 Wine loader; choose Rosetta, DXMT, or Automatic ===" \
+    >> "$log" 2>&1 || true
+  show_alert "D3DMetal is unavailable with FEX" "This runner uses arm64 Wine, but CrossOver's D3DMetal components are x86_64-only. Choose the Rosetta CrossOver tool for this game, or select DXMT/Automatic."
+  exit 1
+}
+
+refuse_fex_d3dmetal
 
 # A quote or backslash in the text would end the AppleScript string early.
 alert_safe() {
@@ -478,18 +628,38 @@ migrate_user_paths() {
 
 lay_out_proton_profile() {
   users="${1:-$WINEPREFIX}/drive_c/users"
-  if [ -d "$users/crossover" ] && [ ! -L "$users/crossover" ]; then
-    echo "=== prefix predates the steamuser layout, rebuild it for cloud saves ===" \
-      >> "$log" 2>&1 || true
-    return 0
-  fi
+  [ ! -L "$users" ] || return 1
   profile="$users/steamuser"
   if [ -L "$profile" ]; then
     echo "=== the profile is a link, rebuild the prefix for cloud saves ===" \
       >> "$log" 2>&1 || true
-    return 0
+    return 1
   fi
-  mkdir -p "$profile" 2>/dev/null || return 0
+  mkdir -p "$profile" 2>/dev/null || return 1
+  if [ -e "$users/crossover" ] && [ ! -L "$users/crossover" ]; then
+    [ -d "$users/crossover" ] || return 1
+    # Keep both originals on conflicts. Registry paths through crossover will
+    # reach steamuser only after the entire merge succeeds.
+    migrate_user_paths "$users/crossover" || return 1
+    profile="$users/steamuser"
+    merge_user_dir "$users/crossover" "$profile" || return 1
+    migrate_user_paths "$profile" || return 1
+    held_profile="$users/crossover BEFORE STEAMUSER"
+    backup_number=2
+    while [ -e "$held_profile" ] || [ -L "$held_profile" ]; do
+      held_profile="$users/crossover BEFORE STEAMUSER $backup_number"
+      backup_number=$((backup_number + 1))
+    done
+    mv "$users/crossover" "$held_profile" || return 1
+    if ! ln -s steamuser "$users/crossover"; then
+      mv "$held_profile" "$users/crossover" || true
+      return 1
+    fi
+    echo "=== cloud-save profile repaired; original kept at $held_profile ===" >> "$log" 2>&1 || true
+  elif [ -L "$users/crossover" ] && [ "$(readlink "$users/crossover")" != steamuser ]; then
+    echo "=== unexpected crossover profile link; left unchanged ===" >> "$log" 2>&1 || true
+    return 1
+  fi
   for folder in Documents Desktop Downloads Music Pictures Videos Templates \
       AppData/Local AppData/Roaming; do
     mkdir -p "$profile/$folder" 2>/dev/null || true
@@ -1035,6 +1205,12 @@ link_fonts() {
 
 if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
   export WINEPREFIX="$STEAM_COMPAT_DATA_PATH/pfx"
+  stage_step="prefix session lock"
+  mkdir -p "$STEAM_COMPAT_DATA_PATH"
+  session_lock="$STEAM_COMPAT_DATA_PATH/.notproton-session.lock"
+  [ ! -L "$session_lock" ] && { [ ! -e "$session_lock" ] || [ -f "$session_lock" ]; } || exit 1
+  exec 6>> "$session_lock"
+  acquire_session_lock
   stage_step="prefix lock"
   prepare_prefix_directory
   msync_from=environment
@@ -1263,6 +1439,29 @@ trap - EXIT
 printf 'launch_args=%s\n' "$launch_args" >> "$log" 2>&1 || true
 printf '=== launching (%s): %s %s ===\n' "$verb" "$WINELOADER" "$*" >> "$log" 2>&1 || true
 
+# The Steam file picker stores an absolute path as data in launch options.
+# A per-game explicit choice takes precedence over the optional data profile.
+if [ "$verb" = waitforexitandrun ]; then
+  case "$NOTPROTON_LAUNCH_TARGET" in
+    '') ;;
+    default) profile_target=""; profile_cwd="" ;;
+    /*) profile_target="$NOTPROTON_LAUNCH_TARGET"; profile_cwd=$(dirname -- "$profile_target") ;;
+    *) echo "=== custom launcher must be an absolute path ===" >> "$log"; exit 1 ;;
+  esac
+fi
+if [ "$verb" = waitforexitandrun ] && [ -n "$profile_target" ]; then
+  [ -f "$profile_target" ] && [ -r "$profile_target" ] || exit 1
+  case "$profile_target" in
+    *.[eE][xX][eE]|*.[bB][aA][tT]|*.[cC][mM][dD]) ;;
+    *) echo "=== unsupported profile launch target ===" >> "$log"; exit 1 ;;
+  esac
+  shift || true
+  set -- "$profile_target" "$@"
+fi
+if [ "$verb" = waitforexitandrun ] && [ -n "$profile_cwd" ]; then
+  [ -d "$profile_cwd" ] || exit 1
+  cd -- "$profile_cwd"
+fi
 target="$1"
 # A game can arrive as a URL with no install path to match, so the verb has to decide the route.
 case "$verb" in
@@ -1278,12 +1477,12 @@ if [ "$foreground" = 0 ]; then
     # runinprefix is the one verb the Linux client keeps on the raw loader.
     runinprefix)
       echo "=== running helper on raw loader: $* ===" >> "$log" 2>&1 || true
-      "$WINELOADER" "$@" >> "$log" 2>&1 || status=$?
+      "$WINELOADER" "$@" 6>&- >> "$log" 2>&1 || status=$?
       ;;
     *)
       # A helper target can be a URL, which steam.exe resolves.
       echo "=== running helper through the shim: $* ===" >> "$log" 2>&1 || true
-      "$WINELOADER" "$shim_exe" "$@" >> "$log" 2>&1 || status=$?
+      "$WINELOADER" "$shim_exe" "$@" 6>&- >> "$log" 2>&1 || status=$?
       ;;
   esac
   echo "=== helper exited status=$status ===" >> "$log" 2>&1 || true
@@ -1293,9 +1492,18 @@ fi
 # Fixes CrossOver window focus issues
 steam_root="$(dirname "$(dirname "$(dirname "$STEAM_COMPAT_DATA_PATH")")")"
 manifest="$steam_root/steamapps/appmanifest_$app_id.acf"
-find_client_root "$STEAM_COMPAT_CLIENT_INSTALL_PATH"
-# Icon stuff
-read_app_meta
+client_root="$STEAM_COMPAT_CLIENT_INSTALL_PATH"
+while [ -n "$client_root" ] && [ "$client_root" != "/" ] && [ ! -d "$client_root/appcache" ]; do
+  client_root=$(dirname "$client_root")
+done
+# Native and Wine launches share one Steam title/icon resolver.
+presentation="$HOME/Library/Application Support/notproton/game-presentation"
+presentation_data=""
+if [ -x "$presentation" ]; then
+  presentation_data=$("$presentation" "$client_root" "$app_id" "$target" 2>> "$log") || presentation_data=""
+fi
+meta_name=$(printf '%s\n' "$presentation_data" | sed -n 's/^name=//p')
+presentation_icon=$(printf '%s\n' "$presentation_data" | sed -n 's/^icon=//p')
 game_name="$meta_name"
 if [ -z "$game_name" ] && [ -f "$manifest" ]; then
   game_name=$(sed -n 's/.*"name"[[:space:]]*"\(.*\)".*/\1/p' "$manifest" | head -1)
@@ -1319,14 +1527,19 @@ loader_res="$loader_contents/Resources"
 mkdir -p "$loader_macos" "$loader_res"
 
 icon_arg=""
-icon_root="$loader_root"
-if resolve_icon && cp -f "$icon_cache" "$loader_res/game.icns"; then
+if [ -n "$presentation_icon" ] && [ -s "$presentation_icon" ] &&
+   cp -f "$presentation_icon" "$loader_res/game.icns"; then
   icon_arg="  <key>CFBundleIconFile</key><string>game</string>"
+else
+  echo "no original game icon resolved, keeping the game's icon" >> "$log" 2>&1 || true
 fi
-[ -n "$icon_arg" ] || echo "no icon resolved, launching without one" >> "$log" 2>&1 || true
 
 uielement_arg=""
-if [ "${NOTPROTON_HIDE_LAUNCHER_TILE:-0}" = "1" ]; then
+game_mode_arg='<key>LSSupportsGameMode</key><true/>'
+if [ "$NOTPROTON_GAME_MODE" = 0 ]; then
+  game_mode_arg='<key>LSSupportsGameMode</key><false/>'
+fi
+if [ "${NOTPROTON_HIDE_LAUNCHER_TILE:-1}" = "1" ]; then
   uielement_arg="  <key>LSUIElement</key><true/>"
   echo "launcher tile hidden by NOTPROTON_HIDE_LAUNCHER_TILE" >> "$log" 2>&1 || true
 fi
@@ -1348,6 +1561,7 @@ cat > "$loader_contents/Info.plist" <<PLIST
   <key>NSCameraUsageDescription</key><string>This game would like to access your camera.</string>
   <key>NSLocalNetworkUsageDescription</key><string>This game would like to access devices on your local network.</string>
 $uielement_arg
+$game_mode_arg
 $icon_arg
 </dict>
 </plist>
@@ -1364,7 +1578,25 @@ for f in "$wine_unix"/*; do
 done
 ln "$WINELOADER" "$loader_macos/wine" 2>/dev/null || cp "$WINELOADER" "$loader_macos/wine"
 if [ -x "$loader_macos/wine" ]; then
-  WINELOADER="$loader_app/Contents/MacOS/wine"
+  # Dock uses the loader's basename even after LaunchServices name updates.
+  # Keep the wine alias for relative runner lookups; give exec its game name.
+  # Keep runner files and the launcher script separate from the game name.
+  loader_named="$loader_macos/game-executable"
+  mkdir -p "$loader_named"
+  loader_process_name="$bundle_name"
+  # Wine loads siblings such as ntdll.so by their original names. A trailing
+  # space avoids replacing a dependency when a game's name collides with it.
+  if [ -e "$wine_unix/$loader_process_name" ]; then
+    loader_process_name="$loader_process_name "
+  fi
+  for f in "$wine_unix"/*; do
+    [ -e "$f" ] || continue
+    case "${f##*/}" in wine|wine.app) continue ;; esac
+    ln -sfn "$f" "$loader_named/${f##*/}"
+  done
+  ln "$loader_macos/wine" "$loader_named/$loader_process_name" 2>/dev/null || \
+    cp "$loader_macos/wine" "$loader_named/$loader_process_name"
+  WINELOADER="$loader_app/Contents/MacOS/game-executable/$loader_process_name"
   echo "loader staged in bundle for game mode" >> "$log" 2>&1 || true
 else
   echo "loader staging failed, game mode unavailable" >> "$log" 2>&1 || true
@@ -1372,16 +1604,40 @@ fi
 
 cat > "$loader_macos/launcher" <<LAUNCHER
 #!/bin/sh
+# Finder and Games open the bundle without Steam's launch environment.
+if [ "\$#" -eq 0 ]; then
+  exec /usr/bin/open "steam://rungameid/$app_id"
+fi
 export WINELOADER="$WINELOADER"
 wine_log="$loader_root/notproton-wine.log"
 exec > "\$wine_log" 2>&1
 shim="$HOME/Library/Application Support/notproton/overlay-shim.dylib"
-if [ -n "\$STEAM_DYLD_INSERT_LIBRARIES" ]; then
-  if [ -f "\$shim" ]; then
-    export DYLD_INSERT_LIBRARIES="\$shim:\$STEAM_DYLD_INSERT_LIBRARIES"
+identity="$HOME/Library/Application Support/notproton/game-identity.dylib"
+# Identity is independent of Steam's overlay setting and graphics backend.
+if [ -f "\$identity" ]; then
+  export DYLD_INSERT_LIBRARIES="\$identity\${DYLD_INSERT_LIBRARIES:+:\$DYLD_INSERT_LIBRARIES}"
+fi
+overlay_mode=normal
+if [ "\$NOTPROTON_DISABLE_OVERLAY" = 1 ]; then
+  overlay_mode=disabled
+elif [ "\$NOTPROTON_DISABLE_OVERLAY_SHIM" = 1 ]; then
+  overlay_mode=valve-only
+fi
+echo "notproton overlay diagnostic mode: \$overlay_mode" >&2
+unset NOTPROTON_OVERLAY_SHIM
+if [ "\$NOTPROTON_DISABLE_OVERLAY" = 1 ]; then
+  unset STEAM_DYLD_INSERT_LIBRARIES
+  if [ -f "\$identity" ]; then
+    export DYLD_INSERT_LIBRARIES="\$identity"
+  else
+    unset DYLD_INSERT_LIBRARIES
+  fi
+elif [ -n "\$STEAM_DYLD_INSERT_LIBRARIES" ]; then
+  if [ -f "\$shim" ] && [ "\$NOTPROTON_DISABLE_OVERLAY_SHIM" != 1 ]; then
+    export DYLD_INSERT_LIBRARIES="\${DYLD_INSERT_LIBRARIES:+\$DYLD_INSERT_LIBRARIES:}\$shim:\$STEAM_DYLD_INSERT_LIBRARIES"
     export NOTPROTON_OVERLAY_SHIM="\$shim"
   else
-    export DYLD_INSERT_LIBRARIES="\$STEAM_DYLD_INSERT_LIBRARIES"
+    export DYLD_INSERT_LIBRARIES="\${DYLD_INSERT_LIBRARIES:+\$DYLD_INSERT_LIBRARIES:}\$STEAM_DYLD_INSERT_LIBRARIES"
   fi
 fi
 [ -n "\$NOTPROTON_GAME_CWD" ] && cd "\$NOTPROTON_GAME_CWD"
@@ -1453,6 +1709,47 @@ install_bundle() (
 )
 install_bundle
 
+wine_helpers='winedevice\.exe|services\.exe|plugplay\.exe|svchost\.exe'
+wine_helpers="$wine_helpers|rpcss\.exe|explorer\.exe|steam\.exe"
+wine_helpers="$wine_helpers|winemenubuilder\.exe|conhost\.exe|start\.exe"
+wine_helpers="$wine_helpers|wineboot\.exe|rundll32\.exe|tabtip\.exe"
+wine_helpers="$wine_helpers|vc_redist|vcredist|dxsetup\.exe|msiexec\.exe"
+wine_helpers="$wine_helpers|installinf|iscriptevaluator\.exe|regsvr32\.exe"
+wine_helpers="$wine_helpers|winedbg\.exe|unitycrashhandler"
+wine_helpers="$wine_helpers|(^|[\\\\/])(upc|ubisoftgamelauncher|uplaywebcore|uplayservice)\.exe([[:space:]]|$)"
+prefix_game_running() {
+  dir=$(prefix_server_dir) || return 1
+  [ -d "$dir" ] || return 1
+  if [ -x "$np_support/sessioncheck" ]; then
+    if "$np_support/sessioncheck" "$dir"; then
+      return 0
+    else
+      session_status=$?
+      case "$session_status" in
+        1) return 1 ;;
+        *) : ;; # Unknown or failed inspection retains the existing fallback.
+      esac
+    fi
+  fi
+  command -v lsof >/dev/null 2>&1 || return 1
+  pids=$(lsof -t +D "$dir" 2>/dev/null | sort -u | tr '\n' ',')
+  pids=${pids%,}
+  [ -n "$pids" ] || return 1
+  # shellcheck disable=SC1003 # the pair matches the backslash in a drive path
+  ps -p "$pids" -o args= 2>/dev/null | grep -E '^[A-Za-z]:\\' | grep -viE "$wine_helpers" | grep -q .
+}
+
+wait_prefix_idle() {
+  idle=0
+  tick=0
+  while [ "$idle" -lt 10 ] && [ "$tick" -lt 300 ]; do
+    tick=$((tick + 1))
+    if prefix_game_running; then idle=0; else idle=$((idle + 1)); fi
+    sleep 1
+  done
+  echo "wait_prefix_idle done after tick=$tick idle=$idle" >> "$log" 2>&1 || true
+}
+
 kill_wine_prefix() {
   "$WINESERVER" -k >> "$log" 2>&1 || true
   "$WINESERVER" -w >> "$log" 2>&1 || true
@@ -1470,8 +1767,10 @@ kill_wine_prefix() {
 
 # Steam's "Exit Game" and the client shutting the game down both send a
 # termination signal to this run script, this handles it
+session_terminated=0
 # shellcheck disable=SC2329 # the trap below invokes this
 terminate() {
+  session_terminated=1
   echo "=== termination signal received, killing wine prefix ===" >> "$log" 2>&1 || true
   kill_wine_prefix
   [ -n "$open_pid" ] && kill "$open_pid" 2>/dev/null || true
@@ -1479,13 +1778,24 @@ terminate() {
 trap terminate TERM INT HUP
 
 game_cwd="$(pwd)"
-if [ -n "$STEAM_DYLD_INSERT_LIBRARIES" ]; then
+overlay_diagnostic_mode=normal
+if [ "$NOTPROTON_DISABLE_OVERLAY" = 1 ]; then
+  overlay_diagnostic_mode=disabled
+elif [ "$NOTPROTON_DISABLE_OVERLAY_SHIM" = 1 ]; then
+  overlay_diagnostic_mode=valve-only
+fi
+echo "=== overlay diagnostic mode staged: $overlay_diagnostic_mode ===" >> "$log" 2>&1 || true
+if [ "$NOTPROTON_DISABLE_OVERLAY" = 1 ]; then
+  echo "=== Valve and NotProton overlay injection disabled for game launcher ===" >> "$log" 2>&1 || true
+elif [ "$NOTPROTON_DISABLE_OVERLAY_SHIM" = 1 ]; then
+  echo "=== NotProton shim omitted; Valve overlay retained: $STEAM_DYLD_INSERT_LIBRARIES ===" >> "$log" 2>&1 || true
+elif [ -n "$STEAM_DYLD_INSERT_LIBRARIES" ]; then
   echo "=== overlay injected from $STEAM_DYLD_INSERT_LIBRARIES ===" >> "$log" 2>&1 || true
 else
   echo "=== client staged no overlay renderer, overlay disabled ===" >> "$log" 2>&1 || true
 fi
 set -- --args "$shim_exe" "$@"
-for name in $(env | LC_ALL=C sed -nE 's/^(CX_APPLEGPTK_LIBD3DSHARED_PATH|Steam[A-Za-z0-9]*|(CX_GRAPHICS|D3DM_|DXMT_|DXVK_|MTL_|ROSETTA_)[A-Z0-9_]*)=.*/\1/p'); do
+for name in $(env | LC_ALL=C sed -nE 's/^(CX_APPLEGPTK_LIBD3DSHARED_PATH|NOTPROTON_GAME_MODE|NOTPROTON_CONSOLE_MODE|NOTPROTON_DISABLE_OVERLAY|NOTPROTON_DISABLE_OVERLAY_SHIM|NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN|Steam[A-Za-z0-9]*|(CX_GRAPHICS|D3DM_|DXMT_|DXVK_|MTL_|ROSETTA_)[A-Z0-9_]*)=.*/\1/p'); do
   eval "value=\$$name"
   # shellcheck disable=SC2154 # eval assigns value on the line above
   set -- --env "$name=$value" "$@"
@@ -1505,16 +1815,50 @@ set -- \
   --env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_COMPAT_CLIENT_INSTALL_PATH" \
   --env STEAM_COMPAT_APP_ID="$STEAM_COMPAT_APP_ID" \
   --env STEAM_DYLD_INSERT_LIBRARIES="$STEAM_DYLD_INSERT_LIBRARIES" \
+  --env NOTPROTON_DISABLE_OVERLAY_SHIM="$NOTPROTON_DISABLE_OVERLAY_SHIM" \
+  --env NOTPROTON_DISABLE_OVERLAY="$NOTPROTON_DISABLE_OVERLAY" \
+  --env NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN="$NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN" \
   --env NOTPROTON_GAME_CWD="$game_cwd" "$@"
+set -- --env NOTPROTON_GAME_NAME="$game_name" \
+  --env NOTPROTON_GAME_ICON="$loader_app/Contents/Resources/game.icns" "$@"
 lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/A"
 lsregister="$lsregister/Frameworks/LaunchServices.framework/Support/lsregister"
 [ -x "$lsregister" ] && "$lsregister" -f "$loader_app" >> "$log" 2>&1 || true
-open -n -W -a "$loader_app" "$@" >> "$log" 2>&1 &
+open -n -W -a "$loader_app" "$@" 6>&- >> "$log" 2>&1 &
 open_pid=$!
-/usr/bin/caffeinate -d -i -w "$open_pid" >> "$log" 2>&1 &
+# Controller input need not reset macOS's idle timer. Hold display/idle-sleep
+# assertions only for this foreground game session; -w also releases them if
+# Steam terminates this script. No persistent power setting is changed.
+if [ -x /usr/bin/caffeinate ]; then
+  /usr/bin/caffeinate -d -i -w "$$" 6>&- 8>&- 9>&- </dev/null >> "$log" 2>&1 &
+fi
 status=0
-wait "$open_pid" || status=$?
-echo "=== game exited status=$status, killing wine prefix ===" >> "$log" 2>&1 || true
+seen=0
+idle=0
+while :; do
+  if prefix_game_running; then
+    seen=1
+    idle=0
+  else
+    idle=$((idle + 1))
+  fi
+  if ! kill -0 "$open_pid" 2>/dev/null; then
+    wait "$open_pid" || status=$?
+    echo "=== bundle exited status=$status ===" >> "$log" 2>&1 || true
+    if [ "$status" -le 128 ]; then
+      wait_prefix_idle
+    fi
+    break
+  fi
+  if [ "$seen" -eq 1 ] && [ "$idle" -ge 10 ]; then
+    echo "=== game tree gone, ending session ===" >> "$log" 2>&1 || true
+    break
+  fi
+  sleep 1
+done
 kill_wine_prefix
 echo "=== wine prefix killed, session ending ===" >> "$log" 2>&1 || true
+if [ "$NOTPROTON_CONSOLE_MODE" = 1 ] && [ "$session_terminated" != 1 ]; then
+  /usr/bin/open 'steam://open/bigpicture' >> "$log" 2>&1 || true
+fi
 exit $status

@@ -22,6 +22,63 @@
 #include <string.h>
 #import <unistd.h>
 
+#include <stdint.h>
+#include <stddef.h>
+
+#define NP_FRAME_HANDOFF_CAPACITY 64
+
+struct np_drawable_handoff {
+	uintptr_t drawable_key;
+	uint32_t queue_slot;
+	uint64_t signal_value;
+};
+
+struct np_drawable_handoff_table {
+	struct np_drawable_handoff entries[NP_FRAME_HANDOFF_CAPACITY];
+};
+
+static inline int np_drawable_handoff_put(struct np_drawable_handoff_table *table,
+						  uintptr_t drawable_key, uint32_t queue_slot,
+						  uint64_t signal_value)
+{
+	if (table == NULL || drawable_key == 0)
+		return 0;
+	struct np_drawable_handoff *free_slot = NULL;
+	for (size_t i = 0; i < NP_FRAME_HANDOFF_CAPACITY; i++) {
+		struct np_drawable_handoff *entry = &table->entries[i];
+		if (entry->drawable_key == drawable_key) {
+			entry->queue_slot = queue_slot;
+			entry->signal_value = signal_value;
+			return 1;
+		}
+		if (free_slot == NULL && entry->drawable_key == 0)
+			free_slot = entry;
+	}
+	if (free_slot == NULL)
+		return 0;
+	free_slot->drawable_key = drawable_key;
+	free_slot->queue_slot = queue_slot;
+	free_slot->signal_value = signal_value;
+	return 1;
+}
+
+static inline int np_drawable_handoff_take(struct np_drawable_handoff_table *table,
+						  uintptr_t drawable_key,
+						  struct np_drawable_handoff *result)
+{
+	if (table == NULL || result == NULL || drawable_key == 0)
+		return 0;
+	for (size_t i = 0; i < NP_FRAME_HANDOFF_CAPACITY; i++) {
+		struct np_drawable_handoff *entry = &table->entries[i];
+		if (entry->drawable_key != drawable_key)
+			continue;
+		*result = *entry;
+		memset(entry, 0, sizeof(*entry));
+		return 1;
+	}
+	return 0;
+}
+
 __attribute__((format(printf, 1, 2)))
 static void shim_log(const char *fmt, ...) {
 	va_list ap;
@@ -171,17 +228,19 @@ static signal_drawable_fn next_signal_drawable;
 static drawable_present_fn next_drawable_present;
 static drawable_present_after_fn next_drawable_present_after;
 
-// The Metal 3 queue and event used to order an overlay after a Metal 4
-// frame.
-static id<MTLCommandQueue> sync_queue;
-static id<MTLEvent> frame_ready;
-static uint64_t frame_ready_value;
+// Give each Metal 4 queue its own event and pair each signal with its drawable.
+#define max_mtl4_queues 16
+struct mtl4_sync_state {
+	id queue_key;
+	id<MTLCommandQueue> overlay_queue;
+	id<MTLEvent> event;
+	uint64_t value;
+};
 
-// The drawable D3DMetal signalled, hooks see it
-// Held without a reference because D3DMetal signals and then
-// presents the same drawable in one call, on one thread.
-static id signalled_drawable;
-static uint64_t signalled_value;
+static struct mtl4_sync_state mtl4_sync_states[max_mtl4_queues];
+static struct np_drawable_handoff_table drawable_handoffs;
+static id retained_handoff_drawables[NP_FRAME_HANDOFF_CAPACITY];
+static os_unfair_lock sync_lock = OS_UNFAIR_LOCK_INIT;
 static int mtl4_sync_logged;
 
 static void queue_signal_event(id queue, id event, uint64_t value)
@@ -513,11 +572,47 @@ static void hook_end_encoding(id self, SEL selector)
 	encoder_clear(self);
 	next_end_encoding(self, selector);
 }
+
+static struct mtl4_sync_state *sync_state_for_queue(id queue, id device)
+{
+	struct mtl4_sync_state *free_state = NULL;
+	for (int i = 0; i < max_mtl4_queues; i++) {
+		struct mtl4_sync_state *state = &mtl4_sync_states[i];
+		if (state->queue_key == queue)
+			return state->overlay_queue != nil && state->event != nil ? state : NULL;
+		if (free_state == NULL && state->queue_key == nil)
+			free_state = state;
+	}
+	if (free_state == NULL)
+		return NULL;
+
+	free_state->queue_key = [queue retain];
+	free_state->overlay_queue = [(id<MTLDevice>)device newCommandQueue];
+	free_state->event = [(id<MTLDevice>)device newEvent];
+	if (free_state->overlay_queue == nil || free_state->event == nil ||
+	    object_device(free_state->overlay_queue) != device) {
+		[free_state->queue_key release];
+		free_state->queue_key = nil;
+		[free_state->overlay_queue release];
+		[free_state->event release];
+		free_state->overlay_queue = nil;
+		free_state->event = nil;
+		return NULL;
+	}
+	return free_state;
+}
+
+static int handoff_slot_for_key(uintptr_t key)
+{
+	for (int i = 0; i < NP_FRAME_HANDOFF_CAPACITY; i++)
+		if (drawable_handoffs.entries[i].drawable_key == key)
+			return i;
+	return -1;
+}
+
 static void hook_signal_drawable(id self, SEL selector, id drawable)
 {
 	next_signal_drawable(self, selector, drawable);
-
-	signalled_drawable = nil;
 
 	if (overlay_text_end == NULL || drawable == nil)
 		return;
@@ -526,21 +621,33 @@ static void hook_signal_drawable(id self, SEL selector, id drawable)
 	if (device == nil)
 		return;
 
-	if (sync_queue == nil) {
-		sync_queue = [(id<MTLDevice>)device newCommandQueue];
-		frame_ready = [(id<MTLDevice>)device newEvent];
-
-		shim_log("overlay_shim hook_signal_drawable: queue=%s event=%s\n",
-		        sync_queue != nil ? "created" : "unavailable",
-		        frame_ready != nil ? "created" : "unavailable");
+	int hooked = 0;
+	os_unfair_lock_lock(&sync_lock);
+	struct mtl4_sync_state *state = sync_state_for_queue(self, device);
+	uintptr_t key = (uintptr_t)drawable;
+	if (state != NULL && np_drawable_handoff_put(&drawable_handoffs, key,
+	                                            (uint32_t)(state - mtl4_sync_states),
+	                                            state->value + 1)) {
+		int slot = handoff_slot_for_key(key);
+		id old_drawable = slot >= 0 ? retained_handoff_drawables[slot] : nil;
+		if (slot >= 0)
+			retained_handoff_drawables[slot] = [drawable retain];
+		state->value++;
+		queue_signal_event(self, state->event, state->value);
+		if (old_drawable != nil)
+			[old_drawable release];
+		hooked = 1;
 	}
+	os_unfair_lock_unlock(&sync_lock);
 
-	if (sync_queue == nil || frame_ready == nil || object_device(sync_queue) != device)
+	if (!hooked) {
+		static int handoff_full_logged;
+		if (!handoff_full_logged) {
+			handoff_full_logged = 1;
+			shim_log("overlay_shim hook_signal_drawable: no per-queue handoff slot; using native present\n");
+		}
 		return;
-
-	signalled_value = ++frame_ready_value;
-	queue_signal_event(self, frame_ready, signalled_value);
-	signalled_drawable = drawable;
+	}
 	ensure_drawable_hooks(drawable);
 }
 
@@ -548,17 +655,33 @@ static void hook_signal_drawable(id self, SEL selector, id drawable)
 // is where the dark magic happens.
 static int present_composited(id drawable, CFTimeInterval duration, int timed)
 {
-	if (drawable == nil || drawable != signalled_drawable || sync_queue == nil ||
-	    frame_ready == nil)
+	if (drawable == nil)
 		return 0;
 
-	signalled_drawable = nil;
-
-	id<MTLCommandBuffer> buffer = [sync_queue commandBuffer];
-	if (buffer == nil)
+	struct np_drawable_handoff handoff = {0};
+	id retained_drawable = nil;
+	os_unfair_lock_lock(&sync_lock);
+	int slot = handoff_slot_for_key((uintptr_t)drawable);
+	int found = np_drawable_handoff_take(&drawable_handoffs, (uintptr_t)drawable, &handoff);
+	struct mtl4_sync_state *state = found && handoff.queue_slot < max_mtl4_queues
+	        ? &mtl4_sync_states[handoff.queue_slot] : NULL;
+	if (slot >= 0) {
+		retained_drawable = retained_handoff_drawables[slot];
+		retained_handoff_drawables[slot] = nil;
+	}
+	os_unfair_lock_unlock(&sync_lock);
+	if (!found || state == NULL || state->overlay_queue == nil || state->event == nil) {
+		[retained_drawable release];
 		return 0;
+	}
 
-	[buffer encodeWaitForEvent:frame_ready value:signalled_value];
+	id<MTLCommandBuffer> buffer = [state->overlay_queue commandBuffer];
+	if (buffer == nil) {
+		[retained_drawable release];
+		return 0;
+	}
+
+	[buffer encodeWaitForEvent:state->event value:handoff.signal_value];
 
 	if (timed)
 		[buffer presentDrawable:(id<CAMetalDrawable>)drawable afterMinimumDuration:duration];
@@ -566,9 +689,9 @@ static int present_composited(id drawable, CFTimeInterval duration, int timed)
 		[buffer presentDrawable:(id<CAMetalDrawable>)drawable];
 
 	[buffer commit];
+	[retained_drawable release];
 
-	if (!mtl4_sync_logged) {
-		mtl4_sync_logged = 1;
+	if (!__atomic_exchange_n(&mtl4_sync_logged, 1, __ATOMIC_RELAXED)) {
 		shim_log("overlay_shim present_composited: Metal 4 frame presented through a "
 		        "Metal 3 buffer waiting on the frame event, overlay composites in order\n");
 	}

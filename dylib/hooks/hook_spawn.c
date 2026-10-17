@@ -1,5 +1,6 @@
 // Strips DYLD_INSERT_LIBRARIES and the SDL block list from child processes
 #include "hooks.h"
+#include "native_presentation.h"
 #include "../util/log.h"
 
 #include <spawn.h>
@@ -7,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
+#include <errno.h>
+
 
 extern int   DobbyHook(void *address, void *replace_call, void **origin_call);
 extern void *DobbySymbolResolver(const char *image_name, const char *symbol_name);
@@ -55,6 +59,11 @@ static char *np_insert_entry;
 
 static int np_is_insert(const char *entry) {
     return strncmp(entry, NP_INSERT_KEY, strlen(NP_INSERT_KEY)) == 0;
+}
+
+static int np_native_presentation_enabled(void) {
+    const char *disabled = getenv("NOTPROTON_DISABLE_NATIVE_PRESENTATION");
+    return !disabled || strcmp(disabled, "1") != 0;
 }
 
 static char **np_with_insert(char *const envp[]) {
@@ -127,6 +136,16 @@ static char **np_without_insert(char *const envp[]) {
 }
 
 static int np_hook_execve(const char *path, char *const argv[], char *const envp[]) {
+    if (np_native_presentation_enabled() && !np_target_keeps_insert(path)) {
+        char **prepared = np_native_presentation_spawn_environment(path, envp);
+        if (prepared) {
+            int rc = orig_execve(path, argv, prepared);
+            int saved_errno = errno;
+            np_native_presentation_free_environment(prepared);
+            errno = saved_errno;
+            return rc;
+        }
+    }
     int keep = np_target_keeps_insert(path);
     char **clean = keep ? np_with_insert(envp) : np_without_insert(envp);
     if (!clean)
@@ -144,6 +163,14 @@ static int np_spawn_filtered(fn_posix_spawn orig, const char *api,
                                    const posix_spawn_file_actions_t *fa,
                                    const posix_spawnattr_t *attr,
                                    char *const argv[], char *const envp[]) {
+    if (np_native_presentation_enabled() && !np_target_keeps_insert(path)) {
+        char **prepared = np_native_presentation_spawn_environment(path, envp);
+        if (prepared) {
+            int rc = orig(pid, path, fa, attr, argv, prepared);
+            np_native_presentation_free_environment(prepared);
+            return rc;
+        }
+    }
     int keep = np_target_keeps_insert(path);
     char **clean = keep ? np_with_insert(envp) : np_without_insert(envp);
     if (!clean)

@@ -186,7 +186,7 @@ do {
         exit(1)
     }
     // A newline in a value would break the key=value framing the caller reads.
-    for key in ["name", "icon", "clienticon", "logo"] {
+    for key in ["name", "icon", "clienticon", "logo", "oslist"] {
         guard case .string(let v)? = common[key], !v.isEmpty else { continue }
         let flat = v.replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")

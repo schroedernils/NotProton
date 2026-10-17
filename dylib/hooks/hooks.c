@@ -50,9 +50,40 @@ static const np_hook_group_t np_steamui_groups[] = {
     { "bundle",   np_hooks_shortcut_bundle_count, np_hooks_shortcut_bundle_defs },
 };
 
+static int g_tool_layout_ok;
+static int g_enabled_layout_ok;
+
+int np_hooks_layout_allowed(const char *label, int tool_layout_ok,
+                            int enabled_layout_ok) {
+    if (!label) return 0;
+    if (strcmp(label, "CCompatManager::BIsCompatibilityToolEnabled") == 0)
+        return enabled_layout_ok;
+    if (strcmp(label, "CCompatManager::FindToolForTargetApp") == 0 ||
+        strcmp(label, "CCompatManager::InternalSpecifyCompatTool") == 0 ||
+        strcmp(label, "CCompatManager::GetOSListOverrideForApp.oslist_gate") == 0 ||
+        strcmp(label, "CCompatManager::ResolveCompatToolForApp.local_redirect") == 0)
+        return tool_layout_ok;
+    return 1;
+}
+
+static int compat_entry_allowed(const np_patch_entry_t *entry) {
+    if (!np_hooks_layout_allowed(entry->label, g_tool_layout_ok,
+                                 g_enabled_layout_ok)) {
+        int tool_dependent = strcmp(entry->label,
+            "CCompatManager::BIsCompatibilityToolEnabled") != 0;
+        const char *reason = tool_dependent ? "compatibility-tool layout" :
+                                              "enabled-flag layout";
+        NP_WARN("[compat] %s: skipped; %s probe failed", entry->label, reason);
+        return 0;
+    }
+    return 1;
+}
+
 // Installs one entry. Returns 1 when the patch lands, 0 when it is skipped or fails.
 static int np_apply_entry(np_resolve_result_t *resolved, const char *group,
                           np_patch_entry_t *e) {
+    if (strcmp(group, "compat") == 0 && !compat_entry_allowed(e))
+        return 0;
     if (np_hooks_env_lists_label("NOTPROTON_DISABLE", e->label)) {
         NP_WARN("[%s] %s: DISABLED via NOTPROTON_DISABLE", group, e->label);
         return 0;
@@ -128,10 +159,10 @@ int np_hooks_install_all(const struct mach_header_64 *mh, intptr_t slide,
         np_lookup_address(resolved, "CCompatManager::FindMapping"),
         np_lookup_address(resolved, "CCompatManager::GetWildcardMapping"));
 
-    np_compat_probe_tool_layout(
+    g_tool_layout_ok = np_compat_probe_tool_layout(
         np_lookup_address(resolved, "CCompatManager::ResolveCompatToolForApp.local_redirect"),
         np_lookup_address(resolved, "CCompatManager::GetOSListOverrideForApp.oslist_gate"));
-    np_compat_probe_enabled_off(
+    g_enabled_layout_ok = np_compat_probe_enabled_off(
         np_lookup_address(resolved, "CCompatManager::BIsCompatibilityToolEnabled"));
 
     uintptr_t register_fn = np_lookup_address(resolved,

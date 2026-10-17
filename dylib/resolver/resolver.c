@@ -45,6 +45,20 @@ static void push(np_resolve_result_t *r, const char *name, uintptr_t addr) {
 static int usable_code_address(const char *name, uintptr_t addr,
                                uintptr_t text, size_t text_sz);
 
+uintptr_t np_reconcile_sites(uintptr_t anchor, uintptr_t aob, const char *name) {
+    if (anchor && aob && anchor != aob) {
+        NP_ERR("resolver: '%s' anchor 0x%lx disagrees with byte pattern 0x%lx; "
+               "rejecting both", name ? name : "<unnamed>",
+               (unsigned long)anchor, (unsigned long)aob);
+        return 0;
+    }
+    uintptr_t agreed = anchor ? anchor : aob;
+    if (agreed)
+        NP_LOG("resolver: '%s' locators agree at 0x%lx", name ? name : "<unnamed>",
+               (unsigned long)agreed);
+    return agreed;
+}
+
 // Single-signature resolution
 uintptr_t np_aob_site(const np_sig_entry_t *sig, uintptr_t text, size_t text_sz) {
     if (!sig || !sig->aob_hex[0]) return 0;
@@ -139,12 +153,11 @@ static uintptr_t try_anchor(np_sig_entry_t *sig,
         return alt;
     }
 
-    if (alt && alt != addr)
-        NP_WARN("resolver: '%s' anchor 0x%lx disagrees with byte pattern 0x%lx; "
-                "keeping the anchor", sig->name, (unsigned long)addr,
-                (unsigned long)alt);
+    addr = np_reconcile_sites(addr, alt, sig->name);
+    if (!addr) return 0;
 
-    NP_LOG("resolver: '%s' -> 0x%lx [anchor]", sig->name, (unsigned long)addr);
+    NP_LOG("resolver: '%s' -> 0x%lx [%s]", sig->name, (unsigned long)addr,
+           alt ? "anchor+aob" : "anchor");
     return addr;
 }
 
