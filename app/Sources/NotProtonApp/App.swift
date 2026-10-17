@@ -8,11 +8,22 @@ struct NotProtonApp: App {
     @State private var prefixes = PrefixesModel()
     @State private var pane: Pane = .status
     @State private var prefixRebuildReview: WinePrefix?
+    @State private var importingWindowsGame = false
+    @State private var supportingGame: WinePrefix?
+    @State private var integration = SteamIntegrationLifecycle(health: SteamIntegrationHealthModel(
+        check: { await Task.detached { SteamIntegrationHealth.check() }.value },
+        authorizedRepair: { _ = try await Task.detached { try SteamIntegrationHealth.recover() }.value }))
     private let updater = AppUpdater()
 
     init() {
         OnboardingWindowController.shared.captureLaunchDisplay()
         AppLog.start()
+        if let executable = Bundle.main.executableURL,
+           Bundle.main.bundleIdentifier == "com.notproton.NotProton" {
+            try? FileManager.default.createDirectory(at: SupportPaths.support, withIntermediateDirectories: true)
+            try? atomicReplace(SupportPaths.support.appending(path: "app-executable"),
+                               with: Data((executable.path + "\n").utf8), step: "Register game settings helper")
+        }
     }
 
     var body: some Scene {
@@ -20,12 +31,26 @@ struct NotProtonApp: App {
             RootView(pane: $pane)
                 .environment(status)
                 .environment(prefixes)
+                .environment(integration)
+                .task { await integration.start() }
                 .frame(minWidth: 720, minHeight: 460)
                 .onChange(of: pane) { prefixes.forgetOutcome() }
                 .onChange(of: status.snapshot?.installedRunners.map(\.id)) {
                     if prefixes.hasLoaded { Task { await prefixes.load() } }
                 }
                 .onOpenURL(perform: handleOpenURL)
+                .sheet(isPresented: $importingWindowsGame) {
+                    VStack(alignment: .trailing) {
+                        Button("Done") { importingWindowsGame = false }.padding([.top, .trailing])
+                        WindowsGameImportView()
+                    }.frame(minWidth: 520, minHeight: 420)
+                }
+                .sheet(item: $supportingGame) { prefix in
+                    VStack(alignment: .trailing) {
+                        Button("Done") { supportingGame = nil }.padding([.top, .trailing])
+                        GameSupportView(prefix: prefix)
+                    }
+                }
                 .confirmationDialog(
                     "Choose a compatibility tool for \(prefixRebuildReview?.title ?? "this game")",
                     isPresented: isChoosingRebuildTool,
@@ -54,6 +79,9 @@ struct NotProtonApp: App {
 
         CommandGroup(after: .appInfo) {
             Button("Check for Updates…") { updater.check() }
+        }
+        CommandGroup(after: .newItem) {
+            Button("Add Windows Game…") { importingWindowsGame = true }
         }
 
         CommandGroup(after: .sidebar) {
@@ -187,6 +215,18 @@ struct NotProtonApp: App {
     }
 
     private func handleOpenURL(_ url: URL) {
+        if let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           parts.scheme == "notproton", parts.host == "game", parts.path == "/support",
+           parts.user == nil, parts.password == nil, parts.port == nil, parts.fragment == nil,
+           let query = parts.queryItems, query.count == 1, query[0].name == "appid",
+           let appID = query[0].value, let id = UInt32(appID), id > 0, String(id) == appID {
+            Task {
+                await prefixes.load()
+                let matches = prefixes.prefixes.filter { $0.appID == appID }
+                if matches.count == 1 { supportingGame = matches.first; pane = .prefixes }
+            }
+            return
+        }
         guard let request = PrefixRebuildRequest.parse(url) else { return }
         pane = .prefixes
         prefixRebuildReview = nil

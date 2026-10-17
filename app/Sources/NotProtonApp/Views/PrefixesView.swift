@@ -8,6 +8,7 @@ struct PrefixesView: View {
     @Environment(\.colorSchemeContrast) private var contrast
     @State private var sortOrder = [KeyPathComparator(\PrefixRow.lastUsed, order: .reverse)]
     @State private var editingProfile: WinePrefix?
+    @State private var supportingGame: WinePrefix?
     @State private var profileNotice: String?
     @State private var winetricksPrefix: WinePrefix?
     @State private var winetricksVerbs = ""
@@ -87,6 +88,12 @@ struct PrefixesView: View {
                 )) {
                     Button("OK", role: .cancel) { profileNotice = nil }
                 } message: { Text(profileNotice ?? "") }
+            }
+            .sheet(item: $supportingGame) { prefix in
+                VStack(alignment: .trailing) {
+                    Button("Done") { supportingGame = nil }.padding([.top, .trailing])
+                    GameSupportView(prefix: prefix)
+                }
             }
             .alert(
                 "Winetricks",
@@ -234,6 +241,11 @@ struct PrefixesView: View {
         }
         .disabled(model.selectedPrefix == nil || model.isBusy)
         .help("Set per-game graphics, display and shared-prefix options.")
+
+        Button("Launch help and saves", systemImage: "lifepreserver") {
+            supportingGame = model.selectedPrefix
+        }
+        .disabled(model.selectedPrefix == nil || model.isBusy)
 
     }
 
@@ -391,6 +403,7 @@ struct PrefixesView: View {
                 Divider()
                 Button("Reveal in Finder") { model.reveal(prefix) }
                 Button("Game Profile…", systemImage: "slider.horizontal.3") { editingProfile = prefix }
+                Button("Launch help and saves…", systemImage: "lifepreserver") { supportingGame = prefix }
                 Menu("Open Log") {
                     ForEach(PrefixLog.allCases, id: \.self) { log in
                         Button(log.label) { model.open(log, for: prefix) }
