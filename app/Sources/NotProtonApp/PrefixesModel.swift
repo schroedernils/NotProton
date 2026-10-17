@@ -153,6 +153,36 @@ final class PrefixesModel {
         PrefixTools.open(log, for: prefix)
     }
 
+    func reviewRebuild(forAppID appID: String) -> WinePrefix? {
+        guard !isBusy else {
+            outcome = String(localized: "Wait for the current prefix operation to finish before reviewing a rebuild.")
+            return nil
+        }
+        let matches = prefixes.filter { $0.appID == appID }
+        guard matches.count == 1, let prefix = matches.first else {
+            outcome = matches.isEmpty
+                ? String(localized: "No game environment was found for Steam App ID \(appID). Launch its Windows game once through NotProton, then try again.")
+                : String(localized: "More than one library has a prefix for Steam App ID \(appID). Select the intended library in Game environments.")
+            return nil
+        }
+        do {
+            try PrefixTools.refuseIfShared(prefix, step: "Recreate prefix")
+        } catch {
+            outcome = error.localizedDescription
+            return nil
+        }
+        guard !PrefixStore.isInUse(prefix) else {
+            outcome = String(localized: "\(prefix.title) is running. Quit the game before rebuilding its prefix.")
+            return nil
+        }
+        selection = [prefix.id]
+        guard !tools.isEmpty else {
+            outcome = String(localized: "Set up a compatibility tool before rebuilding this prefix.")
+            return nil
+        }
+        return prefix
+    }
+
     func delete(_ targets: [WinePrefix]) async {
         await eachInTurn(targets, { try PrefixTools.delete($0) }) { deleted in
             if deleted.count == 1 {

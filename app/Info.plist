@@ -23,6 +23,17 @@
 	<string>NotProton</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.notproton.NotProton.prefix-rebuild</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>notproton</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>0.0.0</string>
 	<key>CFBundleVersion</key>
@@ -35,6 +46,8 @@
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSAppBundlesUsageDescription</key>
+	<string>NotProton needs to update the Steam app to enable Windows games in native macOS Steam.</string>
 	<key>SUFeedURL</key>
 	<string>https://github.com/NotProtonNot/NotProton/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>

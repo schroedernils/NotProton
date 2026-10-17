@@ -6,65 +6,78 @@ struct BackupsView: View {
     @State private var selection = Set<PrefixBackup.ID>()
 
     var body: some View {
-        Group {
-            if !model.hasLoaded {
-                ProgressView("Looking for backups")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.backups.isEmpty {
-                ContentUnavailableView(
-                    String(localized: "No Backups"),
-                    systemImage: "externaldrive.badge.timemachine"
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                table
-            }
-        }
-        .navigationTitle("Prefix Backups")
-        .navigationSubtitle(summary)
-        .safeAreaInset(edge: .bottom) {
-            if let failed = model.report {
-                report(
-                    StatusRow(
-                        title: String(localized: "Failed"),
-                        value: failed.message,
-                        tone: .bad,
-                        action: failed.settingsPane.map { pane in
-                            StatusAction(label: Remedy.settingsButton) { Remedy.openSettings(pane) }
-                        }
+        VStack(alignment: .leading, spacing: 18) {
+            DesktopPageHeader(
+                title: "Backups",
+                subtitle: summary.isEmpty ? "Local copies of your game environments." : summary,
+                symbol: "externaldrive.badge.timemachine")
+            Group {
+                if !model.hasLoaded {
+                    ProgressView("Looking for backups")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if model.backups.isEmpty {
+                    ContentUnavailableView(
+                        "No backups yet",
+                        systemImage: "externaldrive.badge.timemachine",
+                        description: Text(
+                            "Select a game in Game environments and choose Back Up to save a local copy of its Windows environment."
+                        )
                     )
-                )
-            } else if let outcome = model.outcome {
-                report(StatusRow(title: String(localized: "Done"), value: outcome, tone: .ok))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    table
+                }
             }
-        }
-        .toolbar {
-            if #available(macOS 26.1, *) {
-                ToolbarItemGroup(placement: .primaryAction) { strip }
-                    .visibilityPriority(.high)
-            } else {
-                ToolbarItemGroup(placement: .primaryAction) { strip }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        }.padding(24).background(Color(nsColor: .windowBackgroundColor))
+            .safeAreaInset(edge: .bottom) {
+                if let failed = model.report {
+                    report(
+                        StatusRow(
+                            title: String(localized: "Failed"),
+                            value: failed.message,
+                            tone: .bad,
+                            action: failed.settingsPane.map { pane in
+                                StatusAction(label: Remedy.settingsButton) {
+                                    Remedy.openSettings(pane)
+                                }
+                            }
+                        )
+                    )
+                } else if let outcome = model.outcome {
+                    report(StatusRow(title: String(localized: "Done"), value: outcome, tone: .ok))
+                }
             }
-        }
-        .task { if model.prefixes.isEmpty { await model.load() } }
-        .onChange(of: model.backups) { _, kept in
-            selection = selection.filter { id in kept.contains { $0.id == id } }
-        }
-        .confirmationDialog(
-            PrefixPrompt.deleteBackupsTitle(clearing),
-            isPresented: asking,
-            titleVisibility: .visible
-        ) {
-            Button(PrefixPrompt.deleteBackupsButton(clearing), role: .destructive) {
-                let targets = clearing
-                model.pendingConfirmation = nil
-                Task { await model.deleteBackups(targets) }
+            .toolbar {
+                if #available(macOS 26, *) { ToolbarSpacer(.flexible, placement: .primaryAction) }
+                if #available(macOS 26.1, *) {
+                    ToolbarItemGroup(placement: .primaryAction) { strip }
+                        .visibilityPriority(.high)
+                } else {
+                    ToolbarItemGroup(placement: .primaryAction) { strip }
+                }
             }
-            Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
-                .keyboardShortcut(.defaultAction)
-        } message: {
-            Text(PrefixPrompt.deleteBackupsMessage(clearing))
-        }
+            .task { if model.prefixes.isEmpty { await model.load() } }
+            .onChange(of: model.backups) { _, kept in
+                selection = selection.filter { id in kept.contains { $0.id == id } }
+            }
+            .confirmationDialog(
+                PrefixPrompt.deleteBackupsTitle(clearing),
+                isPresented: asking,
+                titleVisibility: .visible
+            ) {
+                Button(PrefixPrompt.deleteBackupsButton(clearing), role: .destructive) {
+                    let targets = clearing
+                    model.pendingConfirmation = nil
+                    Task { await model.deleteBackups(targets) }
+                }
+                Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
+                    .keyboardShortcut(.defaultAction)
+            } message: {
+                Text(PrefixPrompt.deleteBackupsMessage(clearing))
+            }
     }
 
     private var summary: String {
@@ -122,6 +135,7 @@ struct BackupsView: View {
         }
         .disabled(model.isLoading)
         .help("List the backups again and update their sizes.")
+
     }
 
     private var gameWidth: CGFloat {
@@ -169,6 +183,9 @@ struct BackupsView: View {
             }
             .width(min: 70, ideal: takenWidth)
         }
+        .tableStyle(.inset(alternatesRowBackgrounds: true))
+        .scrollContentBackground(.hidden)
+        .font(.system(size: 12))
         .contextMenu(forSelectionType: PrefixBackup.ID.self) { ids in
             actions(for: ids)
         }

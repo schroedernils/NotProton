@@ -1,6 +1,7 @@
 // Deploys core NotProton components into the copy of CrossOver that NotProton deploys to the Steam location
 
 import Foundation
+import Darwin
 
 enum InstallPayload {
     static let step = String(localized: "Find NotProton's components")
@@ -10,6 +11,9 @@ enum InstallPayload {
         let overlayShim: URL
         let iconmaker: URL
         let appinfo: URL
+        let gameIdentity: URL
+        let sessionCheck: URL
+        let gamePresentation: URL
         let run: URL
         let builtAt: Int64
 
@@ -39,6 +43,9 @@ enum InstallPayload {
         let shim = root.appending(path: "overlay-shim.dylib")
         let iconmaker = root.appending(path: "iconmaker")
         let appinfo = root.appending(path: "appinfo")
+        let gameIdentity = root.appending(path: SupportPaths.gameIdentityName)
+        let sessionCheck = root.appending(path: SupportPaths.sessionCheckName)
+        let gamePresentation = root.appending(path: SupportPaths.gamePresentationName)
         let run = root.appending(path: "run")
         let stamp = try? String(contentsOf: root.appending(path: "build-time"), encoding: .utf8)
         let builtAt = stamp.flatMap { Int64($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
@@ -55,6 +62,15 @@ enum InstallPayload {
         }
         if !files.fileExists(atPath: appinfo.path(percentEncoded: false)) {
             missing.append("appinfo")
+        }
+        if !files.fileExists(atPath: gameIdentity.path(percentEncoded: false)) {
+            missing.append(SupportPaths.gameIdentityName)
+        }
+        if !isExecutableRegularFile(sessionCheck) {
+            missing.append(SupportPaths.sessionCheckName)
+        }
+        if !isExecutableRegularFile(gamePresentation) {
+            missing.append(SupportPaths.gamePresentationName)
         }
         if !files.fileExists(atPath: run.path(percentEncoded: false)) { missing.append("run") }
         if (builtAt ?? 0) <= 0 { missing.append("build-time") }
@@ -80,8 +96,17 @@ enum InstallPayload {
 
         return Located(
             dylib: dylib, overlayShim: shim, iconmaker: iconmaker,
-            appinfo: appinfo, run: run, builtAt: builtAt, signatures: signatures,
+            appinfo: appinfo, gameIdentity: gameIdentity, sessionCheck: sessionCheck,
+            gamePresentation: gamePresentation,
+            run: run, builtAt: builtAt, signatures: signatures,
             fontsRoot: fontsRoot, fonts: fonts
         )
+    }
+
+    private static func isExecutableRegularFile(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path(percentEncoded: false), &info) == 0
+            && info.st_mode & S_IFMT == S_IFREG
+            && FileManager.default.isExecutableFile(atPath: url.path(percentEncoded: false))
     }
 }

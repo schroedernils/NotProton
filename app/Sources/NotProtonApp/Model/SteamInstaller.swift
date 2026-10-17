@@ -77,7 +77,10 @@ enum SteamInstaller {
         stopClient: ClientStopper = stopTheClient,
         register: BundleRegistrar = { SteamBundle.register($0) },
         resetInputAccess: () -> Void = resetInputAccess,
-        report: @escaping @Sendable (InstallPhase) -> Void = { _ in }
+        report: @escaping @Sendable (InstallPhase) -> Void = { _ in },
+        gameIdentity: URL = SupportPaths.gameIdentity,
+        sessionCheck: URL = SupportPaths.sessionCheck,
+        gamePresentation: URL = SupportPaths.gamePresentation
     ) throws -> InstallOutcome {
         report(.checkingPayload)
         let payload = try suppliedPayload ?? InstallPayload.locate()
@@ -104,7 +107,8 @@ enum SteamInstaller {
         let files = DeploymentContent.files(
             payload: payload, bridgePayload: bridgeLocated, app: app, bridge: bridge,
             signatures: signatures, fonts: fonts, overlayShim: overlayShim, iconmaker: iconmaker, appinfo: appinfo,
-            compatTools: compatTools, tools: tools, runners: runners)
+            compatTools: compatTools, tools: tools, runners: runners,
+            gameIdentity: gameIdentity, sessionCheck: sessionCheck, gamePresentation: gamePresentation)
         let content = try DeploymentContent.inspect(files: files, bundled: build, installed: previousBuild,
                                                    legacyVersion: SteamBundle.deployedVersion(at: deployedVersion))
         guard content != .newerInstalled else {

@@ -7,9 +7,11 @@ struct NotProtonApp: App {
     @State private var status = SystemStatus()
     @State private var prefixes = PrefixesModel()
     @State private var pane: Pane = .status
+    @State private var prefixRebuildReview: WinePrefix?
     private let updater = AppUpdater()
 
     init() {
+        OnboardingWindowController.shared.captureLaunchDisplay()
         AppLog.start()
     }
 
@@ -22,6 +24,24 @@ struct NotProtonApp: App {
                 .onChange(of: pane) { prefixes.forgetOutcome() }
                 .onChange(of: status.snapshot?.installedRunners.map(\.id)) {
                     if prefixes.hasLoaded { Task { await prefixes.load() } }
+                }
+                .onOpenURL(perform: handleOpenURL)
+                .confirmationDialog(
+                    "Choose a compatibility tool for \(prefixRebuildReview?.title ?? "this game")",
+                    isPresented: isChoosingRebuildTool,
+                    titleVisibility: .visible
+                ) {
+                    if let prefix = prefixRebuildReview {
+                        ForEach(prefixes.tools) { tool in
+                            Button(tool.display) {
+                                prefixRebuildReview = nil
+                                prefixes.pendingConfirmation = .rebuild([prefix], tool)
+                            }
+                        }
+                    }
+                    Button("Cancel", role: .cancel) { prefixRebuildReview = nil }
+                } message: {
+                    Text("Choose the installed tool to use. NotProton will ask before rebuilding and offers to keep a backup.")
                 }
         }
         .defaultSize(width: 900, height: 760)
@@ -39,23 +59,25 @@ struct NotProtonApp: App {
         CommandGroup(after: .sidebar) {
             Button("Status") { pane = .status }
                 .keyboardShortcut("1", modifiers: .command)
-            Button("Prefixes") { pane = .prefixes }
+            Button("Game environments") { pane = .prefixes }
                 .keyboardShortcut("2", modifiers: .command)
-            Button("Prefix Backups") { pane = .backups }
+            Button("Backups") { pane = .backups }
                 .keyboardShortcut("3", modifiers: .command)
+            Button("Help") { pane = .help }
+                .keyboardShortcut("4", modifiers: .command)
 
             Divider()
 
             Button("Refresh") {
                 Task {
                     switch pane {
-                    case .status: await status.refresh()
+                    case .status, .help, .settings: await status.refresh()
                     case .prefixes, .backups: await prefixes.load()
                     }
                 }
             }
             .keyboardShortcut("r", modifiers: .command)
-            .disabled(pane == .status ? !status.isIdle : prefixes.isLoading)
+            .disabled(pane == .status || pane == .help || pane == .settings ? !status.isIdle : prefixes.isLoading)
 
             Divider()
         }
@@ -155,6 +177,29 @@ struct NotProtonApp: App {
 
     private var selectionTargets: [WinePrefix] {
         prefixes.isBusy ? [] : prefixes.selectedPrefixes
+    }
+
+    private var isChoosingRebuildTool: Binding<Bool> {
+        Binding(
+            get: { prefixRebuildReview != nil },
+            set: { if !$0 { prefixRebuildReview = nil } }
+        )
+    }
+
+    private func handleOpenURL(_ url: URL) {
+        guard let request = PrefixRebuildRequest.parse(url) else { return }
+        pane = .prefixes
+        prefixRebuildReview = nil
+        prefixes.pendingConfirmation = nil
+        Task {
+            await prefixes.load()
+            guard let prefix = prefixes.reviewRebuild(forAppID: request.appID) else { return }
+            if prefixes.tools.count == 1, let tool = prefixes.tools.first {
+                prefixes.pendingConfirmation = .rebuild([prefix], tool)
+            } else {
+                prefixRebuildReview = prefix
+            }
+        }
     }
 
     @ViewBuilder

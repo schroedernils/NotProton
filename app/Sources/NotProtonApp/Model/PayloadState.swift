@@ -1,6 +1,7 @@
 // Checks files on disk versus the manifest, presents state to user
 
 import Foundation
+import Darwin
 
 struct PayloadState: Sendable {
     var expected: Int
@@ -9,6 +10,9 @@ struct PayloadState: Sendable {
     var overlayShimPresent: Bool
     var iconmakerPresent: Bool
     var appinfoPresent: Bool
+    var gameIdentityPresent: Bool = false
+    var sessionCheckPresent: Bool = true
+    var gamePresentationPresent: Bool = false
     var signatureDatabase: String?
     var legacyCompatPresent: Int
     var legacyCompatExpected: Int
@@ -23,6 +27,9 @@ struct PayloadState: Sendable {
         if !overlayShimPresent { names.append("overlay-shim.dylib") }
         if !iconmakerPresent { names.append("iconmaker") }
         if !appinfoPresent { names.append("appinfo") }
+        if !gameIdentityPresent { names.append(SupportPaths.gameIdentityName) }
+        if !sessionCheckPresent { names.append(SupportPaths.sessionCheckName) }
+        if !gamePresentationPresent { names.append(SupportPaths.gamePresentationName) }
         return names
     }
 
@@ -32,6 +39,7 @@ struct PayloadState: Sendable {
 
     var isEmpty: Bool {
         present == 0 && !overlayShimPresent && !iconmakerPresent && !appinfoPresent
+            && !gameIdentityPresent && !sessionCheckPresent && !gamePresentationPresent
             && signatureDatabase == nil
     }
 
@@ -43,7 +51,9 @@ struct PayloadState: Sendable {
 enum PayloadInspector {
 
     static func inspect(
-        bridge: URL = SupportPaths.bridge, builds: [RunnerBuild] = RunnerStore.installedBuilds()
+        bridge: URL = SupportPaths.bridge, builds: [RunnerBuild] = RunnerStore.installedBuilds(),
+        support: URL = SupportPaths.support,
+        legacyCompat: URL = SupportPaths.Steam.legacyCompat
     ) -> PayloadState {
         let fm = FileManager.default
 
@@ -67,7 +77,7 @@ enum PayloadInspector {
             .map { URL(filePath: $0.bridgePath).lastPathComponent }
         let legacyPresent = legacyNames.filter {
             fm.fileExists(
-                atPath: SupportPaths.Steam.legacyCompat
+                atPath: legacyCompat
                     .appending(path: $0).path(percentEncoded: false)
             )
         }.count
@@ -76,14 +86,26 @@ enum PayloadInspector {
             expected: expected,
             present: expected - missing.count,
             missing: missing,
-            overlayShimPresent: fm.fileExists(atPath: SupportPaths.overlayShim.path(percentEncoded: false)),
-            iconmakerPresent: fm.fileExists(atPath: SupportPaths.iconmaker.path(percentEncoded: false)),
-            appinfoPresent: fm.fileExists(atPath: SupportPaths.appinfo.path(percentEncoded: false)),
-            signatureDatabase: newestSignatureDatabase(),
+            overlayShimPresent: isRegularFile(support.appending(path: "overlay-shim.dylib")),
+            iconmakerPresent: isRegularFile(support.appending(path: "iconmaker")),
+            appinfoPresent: isRegularFile(support.appending(path: "appinfo")),
+            gameIdentityPresent: isRegularFile(support.appending(path: SupportPaths.gameIdentityName)),
+            sessionCheckPresent: isExecutableRegularFile(support.appending(path: SupportPaths.sessionCheckName)),
+            gamePresentationPresent: isExecutableRegularFile(support.appending(path: SupportPaths.gamePresentationName)),
+            signatureDatabase: newestSignatureDatabase(in: support.appending(path: "signatures/macos.arm64")),
             legacyCompatPresent: legacyPresent,
             legacyCompatExpected: legacyNames.count,
             manifestProblem: problem
         )
+    }
+
+    private static func isRegularFile(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path(percentEncoded: false), &info) == 0 && info.st_mode & S_IFMT == S_IFREG
+    }
+
+    private static func isExecutableRegularFile(_ url: URL) -> Bool {
+        isRegularFile(url) && FileManager.default.isExecutableFile(atPath: url.path(percentEncoded: false))
     }
 
     private static func expand(_ entry: PayloadEntry, for builds: [RunnerBuild]) -> [PayloadEntry] {

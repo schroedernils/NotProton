@@ -7,124 +7,162 @@ struct PrefixesView: View {
     @Environment(PrefixesModel.self) private var model
     @Environment(\.colorSchemeContrast) private var contrast
     @State private var sortOrder = [KeyPathComparator(\PrefixRow.lastUsed, order: .reverse)]
+    @State private var editingProfile: WinePrefix?
+    @State private var profileNotice: String?
     @State private var winetricksPrefix: WinePrefix?
     @State private var winetricksVerbs = ""
 
     var body: some View {
-        Group {
-            if !model.hasLoaded {
-                ProgressView("Looking for prefixes")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.prefixes.isEmpty {
-                ContentUnavailableView(
-                    String(localized: "No Prefixes"),
-                    systemImage: "externaldrive",
-                    description: Text(
-                        String(localized: "A prefix appears here once a Windows game has been launched through NotProton.")
-                    )
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                table
+        VStack(alignment: .leading, spacing: 18) {
+            DesktopPageHeader(
+                title: "Game environments",
+                subtitle: "Manage the Windows environment for each Steam game.",
+                symbol: "externaldrive")
+            Group {
+                if !model.hasLoaded {
+                    ProgressView("Looking for prefixes")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if model.prefixes.isEmpty {
+                    emptyState
+                } else {
+                    table
+                }
             }
-        }
-        .navigationTitle("Prefixes")
-        .safeAreaInset(edge: .bottom) {
-            if let failed = model.report {
-                report(
-                    StatusRow(
-                        title: String(localized: "Failed"),
-                        value: failed.message,
-                        tone: .bad,
-                        action: failed.settingsPane.map { pane in
-                            StatusAction(label: Remedy.settingsButton) { Remedy.openSettings(pane) }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        }.padding(24).background(Color(nsColor: .windowBackgroundColor))
+            .safeAreaInset(edge: .bottom) {
+                if let failed = model.report {
+                    report(
+                        StatusRow(
+                            title: "Failed",
+                            value: failed.message,
+                            tone: .bad,
+                            action: failed.settingsPane.map { pane in
+                                StatusAction(label: Remedy.settingsButton) {
+                                    Remedy.openSettings(pane)
+                                }
+                            }
+                        )
+                    )
+                } else if let outcome = model.outcome {
+                    report(
+                        StatusRow(
+                            title: "Done",
+                            value: outcome,
+                            tone: .ok
+                        )
+                    )
+                }
+            }
+            .toolbar {
+                if #available(macOS 26, *) { ToolbarSpacer(.flexible, placement: .primaryAction) }
+                if #available(macOS 26.1, *) {
+                    ToolbarItemGroup(placement: .primaryAction) { strip }
+                        .visibilityPriority(.high)
+                } else {
+                    ToolbarItemGroup(placement: .primaryAction) { strip }
+                }
+            }
+            .task { if model.prefixes.isEmpty { await model.load() } }
+            .sheet(item: $editingProfile) { prefix in
+                GameProfileView(
+                    prefix: prefix,
+                    installedGraphics: GameProfileStore.graphicsBackends(for: prefix),
+                    onSave: { profile in
+                        do {
+                            try GameProfileStore.save(profile, for: prefix)
+                            editingProfile = nil
+                            return nil
+                        } catch {
+                            profileNotice = error.localizedDescription
+                            return error.localizedDescription
                         }
-                    )
+                    }
                 )
-            } else if let outcome = model.outcome {
-                report(
-                    StatusRow(
-                        title: String(localized: "Done"),
-                        value: outcome,
-                        tone: .ok
-                    )
-                )
+                .frame(minWidth: 470, minHeight: 430)
+                .alert("Game Profile", isPresented: Binding(
+                    get: { profileNotice != nil }, set: { if !$0 { profileNotice = nil } }
+                )) {
+                    Button("OK", role: .cancel) { profileNotice = nil }
+                } message: { Text(profileNotice ?? "") }
             }
-        }
-        .toolbar {
-            if #available(macOS 26.1, *) {
-                ToolbarItemGroup(placement: .primaryAction) { strip }
-                    .visibilityPriority(.high)
-            } else {
-                ToolbarItemGroup(placement: .primaryAction) { strip }
-            }
-        }
-        .task { if model.prefixes.isEmpty { await model.load() } }
-        .confirmationDialog(
-            PrefixPrompt.deleteTitle(deleting),
-            isPresented: asking(.delete),
-            titleVisibility: .visible
-        ) {
-            Button(PrefixPrompt.deleteButton(deleting), role: .destructive) {
-                let targets = deleting
-                model.pendingConfirmation = nil
-                Task { await model.delete(targets) }
-            }
-            Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
+            .alert(
+                "Winetricks",
+                isPresented: Binding(
+                    get: { winetricksPrefix != nil },
+                    set: { if !$0 { winetricksPrefix = nil } }
+                ),
+                presenting: winetricksPrefix
+            ) { prefix in
+                TextField("vcrun2022 corefonts", text: $winetricksVerbs)
+                Button("Install") {
+                    let verbs = winetricksVerbs
+                    Task { await model.winetricks(verbs, in: prefix) }
+                }
                 .keyboardShortcut(.defaultAction)
-        } message: {
-            Text(PrefixPrompt.deleteMessage(deleting))
-        }
-        .confirmationDialog(
-            PrefixPrompt.rebuildTitle(rebuilding, for: rebuildTool),
-            isPresented: asking(.rebuild),
-            titleVisibility: .visible
-        ) {
-            Button(PrefixPrompt.rebuildWithBackupButton(rebuilding)) {
-                model.confirmRebuild()
+                .disabled(PrefixTools.winetricksVerbs(winetricksVerbs).isEmpty)
+                Button("Cancel", role: .cancel) {}
+            } message: { prefix in
+                Text("Enter the Winetricks verbs to install in \(prefix.title), separated by spaces.")
             }
-            .keyboardShortcut(.defaultAction)
-            Button(PrefixPrompt.rebuildWithoutBackupButton(rebuilding)) {
-                model.confirmRebuild(keepBackup: false)
+            .confirmationDialog(
+                PrefixPrompt.deleteTitle(deleting),
+                isPresented: asking(.delete),
+                titleVisibility: .visible
+            ) {
+                Button(PrefixPrompt.deleteButton(deleting), role: .destructive) {
+                    let targets = deleting
+                    model.pendingConfirmation = nil
+                    Task { await model.delete(targets) }
+                }
+                Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
+                    .keyboardShortcut(.defaultAction)
+            } message: {
+                Text(PrefixPrompt.deleteMessage(deleting))
             }
-            Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
-        } message: {
-            Text(PrefixPrompt.rebuildMessage())
-        }
-        .confirmationDialog(
-            PrefixPrompt.backUpTitle(backingUp),
-            isPresented: asking(.backUp),
-            titleVisibility: .visible
-        ) {
-            Button(PrefixPrompt.backUpButton(backingUp)) {
-                let targets = backingUp
-                model.pendingConfirmation = nil
-                Task { await model.backUp(targets) }
+            .confirmationDialog(
+                PrefixPrompt.rebuildTitle(rebuilding, for: rebuildTool),
+                isPresented: asking(.rebuild),
+                titleVisibility: .visible
+            ) {
+                Button(PrefixPrompt.rebuildWithBackupButton(rebuilding)) {
+                    model.confirmRebuild()
+                }
+                .keyboardShortcut(.defaultAction)
+                Button(PrefixPrompt.rebuildWithoutBackupButton(rebuilding)) {
+                    model.confirmRebuild(keepBackup: false)
+                }
+                Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
+            } message: {
+                Text(PrefixPrompt.rebuildMessage())
             }
-            .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
-        } message: {
-            Text(PrefixPrompt.backUpMessage(backingUp))
-        }
-        .alert(
-            "Winetricks",
-            isPresented: Binding(
-                get: { winetricksPrefix != nil },
-                set: { if !$0 { winetricksPrefix = nil } }
-            ),
-            presenting: winetricksPrefix
-        ) { prefix in
-            TextField("vcrun2022 corefonts", text: $winetricksVerbs)
-            Button("Install") {
-                let verbs = winetricksVerbs
-                Task { await model.winetricks(verbs, in: prefix) }
+            .confirmationDialog(
+                PrefixPrompt.backUpTitle(backingUp),
+                isPresented: asking(.backUp),
+                titleVisibility: .visible
+            ) {
+                Button(PrefixPrompt.backUpButton(backingUp)) {
+                    let targets = backingUp
+                    model.pendingConfirmation = nil
+                    Task { await model.backUp(targets) }
+                }
+                .keyboardShortcut(.defaultAction)
+                Button("Cancel", role: .cancel) { model.pendingConfirmation = nil }
+            } message: {
+                Text(PrefixPrompt.backUpMessage(backingUp))
             }
-            .keyboardShortcut(.defaultAction)
-            .disabled(PrefixTools.winetricksVerbs(winetricksVerbs).isEmpty)
-            Button("Cancel", role: .cancel) {}
-        } message: { prefix in
-            Text("Enter the Winetricks verbs to install in \(prefix.title), separated by spaces.")
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "externaldrive").font(.largeTitle).foregroundStyle(.secondary)
+            Text("No game environments yet").font(.headline)
+            Text("Launch a Windows game through NotProton in Steam first. Its Windows environment (prefix) will appear here, with tools and backup actions.")
+                .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 440)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private enum Question {
@@ -190,6 +228,13 @@ struct PrefixesView: View {
         }
         .disabled(model.isLoading)
         .help("List the prefixes again and update their sizes.")
+
+        Button("Game Profile", systemImage: "slider.horizontal.3") {
+            editingProfile = model.selectedPrefix
+        }
+        .disabled(model.selectedPrefix == nil || model.isBusy)
+        .help("Set per-game graphics, display and shared-prefix options.")
+
     }
 
     private func lastUsed(_ prefix: WinePrefix) -> String {
@@ -270,7 +315,7 @@ struct PrefixesView: View {
                     Text(prefix.title).help(prefix.title)
                     if prefix.name == nil {
                         Text("No longer installed")
-                            .font(.caption)
+                            .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                     }
                     if model.busy.contains(prefix.id) {
@@ -323,6 +368,9 @@ struct PrefixesView: View {
             .width(min: 60, ideal: lastUsedWidth)
 
         }
+        .tableStyle(.inset(alternatesRowBackgrounds: true))
+        .scrollContentBackground(.hidden)
+        .font(.system(size: 12))
         .contextMenu(forSelectionType: WinePrefix.ID.self) { ids in
             actions(for: ids)
         }
@@ -342,6 +390,7 @@ struct PrefixesView: View {
                 toolButtons(for: prefix)
                 Divider()
                 Button("Reveal in Finder") { model.reveal(prefix) }
+                Button("Game Profile…", systemImage: "slider.horizontal.3") { editingProfile = prefix }
                 Menu("Open Log") {
                     ForEach(PrefixLog.allCases, id: \.self) { log in
                         Button(log.label) { model.open(log, for: prefix) }

@@ -306,15 +306,25 @@ enum PrefixStore {
         _ prefix: WinePrefix, root: URL = serverRoot, lsof: String = "/usr/sbin/lsof",
         drainTimeout: DispatchTimeInterval = .seconds(2)
     ) -> Bool {
-        let lock = open(prefix.root.appending(path: ".notproton-prefix.lock").path(percentEncoded: false), O_RDWR | O_NOFOLLOW | O_CLOEXEC)
-        if lock >= 0 {
-            defer { FileLock.release(lock) }
-            var info = stat()
-            guard fstat(lock, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
-                flock(lock, LOCK_EX | LOCK_NB) == 0
-            else { return true }
-        } else if errno != ENOENT {
+        do {
+            if let owner = try GameProfileStore.owner(of: prefix) {
+                return isInUse(owner, root: root, lsof: lsof, drainTimeout: drainTimeout)
+            }
+        } catch {
             return true
+        }
+        for name in [".notproton-session.lock", ".notproton-prefix.lock"] {
+            let lockPath = prefix.root.appending(path: name).path(percentEncoded: false)
+            let lock = open(lockPath, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+            if lock >= 0 {
+                defer { FileLock.release(lock) }
+                var info = stat()
+                guard fstat(lock, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                    !isLockfHeld(lock), flock(lock, LOCK_EX | LOCK_NB) == 0
+                else { return true }
+            } else if errno != ENOENT {
+                return true
+            }
         }
 
         guard let dir = serverDirectory(of: prefix, root: root),
@@ -328,5 +338,12 @@ enum PrefixStore {
         if !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
 
         return result.outputLost || !result.stderr.isEmpty
+    }
+
+    private static func isLockfHeld(_ fd: Int32) -> Bool {
+        var query = flock()
+        query.l_type = Int16(F_WRLCK)
+        query.l_whence = Int16(SEEK_SET)
+        return fcntl(fd, F_GETLK, &query) == -1 || query.l_type != Int16(F_UNLCK)
     }
 }

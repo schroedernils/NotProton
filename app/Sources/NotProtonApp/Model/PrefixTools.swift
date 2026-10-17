@@ -122,7 +122,7 @@ enum PrefixTools {
 
     static func environment(
         prefix: WinePrefix, runner: URL, flavor: CompatTool.Flavor = .fex
-    ) -> [String: String] {
+    ) throws -> [String: String] {
         let root = runner.path(percentEncoded: false)
         var environment = ProcessInfo.processInfo.environment
         environment["CX_ROOT"] = root
@@ -133,10 +133,44 @@ enum PrefixTools {
         environment["WINESERVER"] = wine.server.path(percentEncoded: false)
         environment["WINEDLLPATH"] = "\(root)/lib/wine/x86_64-windows:"
             + wine.unixDir.path(percentEncoded: false)
-        environment["WINEPREFIX"] = prefix.pfx.path(percentEncoded: false)
-        environment["WINEMSYNC"] = syncBackend(prefix: prefix)
+        let resolved = try GameProfileStore.resolveRoot(for: prefix)
+        environment["WINEPREFIX"] = resolved.path(percentEncoded: false)
+        let profile = try GameProfileStore.load(for: prefix)
+        let inherited = ProcessInfo.processInfo.environment
+        if inherited["WINEMSYNC"] == nil {
+            let profileSync = profile.msync
+            environment["WINEMSYNC"] = profileSync == .default
+                ? syncBackend(prefix: prefix) : profileSync.rawValue
+        }
+        if inherited["CX_GRAPHICS_BACKEND"] == nil,
+           let backend = profile.graphics.runtimeBackend {
+            environment["CX_GRAPHICS_BACKEND"] = backend
+        }
+        if inherited["NOTPROTON_RETINA"] == nil, profile.retina != .default {
+            let value = profile.retina
+            environment["NOTPROTON_RETINA"] = value.rawValue
+        }
+        if inherited["NOTPROTON_HIDE_LAUNCHER_TILE"] == nil,
+           profile.hideLauncherTile != .default {
+            let value = profile.hideLauncherTile
+            environment["NOTPROTON_HIDE_LAUNCHER_TILE"] = value.rawValue
+        }
+        if inherited["SteamDisableOverlayDPIScaling"] == nil,
+           profile.overlayDPI == .disabled {
+            environment["SteamDisableOverlayDPIScaling"] = "1"
+        }
+        if inherited["NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN"] == nil,
+           profile.fullscreenDisplayCapture == .released {
+            environment["NOTPROTON_RELEASE_DISPLAYS_FULLSCREEN"] = "1"
+        }
         environment["PATH"] = "\(root)/bin:" + (environment["PATH"] ?? "/usr/bin:/bin")
         return environment
+    }
+
+    static func checkedEnvironment(
+        prefix: WinePrefix, runner: URL, flavor: CompatTool.Flavor = .fex
+    ) throws -> [String: String] {
+        try environment(prefix: prefix, runner: runner, flavor: flavor)
     }
 
     static func loader(runner: URL, flavor: CompatTool.Flavor = .fex) -> URL {
@@ -182,7 +216,12 @@ enum PrefixTools {
                 detail: String(localized: "No compatibility tool at \(loader.path(percentEncoded: false)). Use Set Up Compatibility Tool first.")
             )
         }
-        guard FileManager.default.fileExists(atPath: prefix.pfx.path(percentEncoded: false)) else {
+        let resolved: URL
+        do { resolved = try GameProfileStore.resolveRoot(for: prefix) }
+        catch {
+            throw StepFailure(step: step, detail: error.localizedDescription)
+        }
+        guard FileManager.default.fileExists(atPath: resolved.path(percentEncoded: false)) else {
             throw StepFailure(
                 step: step,
                 detail: String(localized: "\(prefix.title) has no prefix at \(prefix.pfx.path(percentEncoded: false)).")
@@ -202,18 +241,20 @@ enum PrefixTools {
     static func launch(
         _ tool: WineTool, in prefix: WinePrefix, runner: URL, flavor: CompatTool.Flavor = .fex
     ) throws {
+        try refuseWhileSharedPrefixInUse(prefix, step: "Open \(tool.label)")
+        try requireValidOwner(prefix, step: "Open \(tool.label)")
         let loader = try readyLoader(
-            step: String(localized: "Open \(tool.label)"), prefix: prefix, runner: runner, flavor: flavor
+            step: "Open \(tool.label)", prefix: prefix, runner: runner, flavor: flavor
         )
         try Shell.detach(
             loader.path(percentEncoded: false),
             [tool.rawValue],
-            environment: environment(prefix: prefix, runner: runner, flavor: flavor)
+            environment: try checkedEnvironment(prefix: prefix, runner: runner, flavor: flavor)
         )
     }
 
     static func run(_ executable: URL, in prefix: WinePrefix) throws {
-        let chosen = try resolvedTool(step: String(localized: "Run \(executable.lastPathComponent)"), for: prefix)
+        let chosen = try resolvedTool(step: "Run \(executable.lastPathComponent)", for: prefix)
         try run(
             executable, in: prefix, runner: SupportPaths.clonedRoot(forBuild: chosen.build),
             flavor: chosen.tool.flavor
@@ -227,6 +268,8 @@ enum PrefixTools {
         flavor: CompatTool.Flavor = .fex
     ) throws {
         let step = String(localized: "Run \(executable.lastPathComponent)")
+        try refuseWhileSharedPrefixInUse(prefix, step: step)
+        try requireValidOwner(prefix, step: step)
         let loader = try readyLoader(step: step, prefix: prefix, runner: runner, flavor: flavor)
         guard FileManager.default.fileExists(atPath: executable.path(percentEncoded: false)) else {
             throw StepFailure(step: step, detail: String(localized: "No file at \(executable.path(percentEncoded: false))."))
@@ -238,11 +281,12 @@ enum PrefixTools {
             )
         }
 
+        let profile = try GameProfileStore.load(for: prefix)
         try Shell.detach(
             loader.path(percentEncoded: false),
             arguments,
-            environment: environment(prefix: prefix, runner: runner, flavor: flavor),
-            currentDirectory: executable.deletingLastPathComponent()
+            environment: try checkedEnvironment(prefix: prefix, runner: runner, flavor: flavor),
+            currentDirectory: profile.launchCwd.map { URL(filePath: $0) } ?? executable.deletingLastPathComponent()
         )
     }
 
@@ -280,26 +324,22 @@ enum PrefixTools {
         guard !verbs.isEmpty else {
             throw StepFailure(step: step, detail: String(localized: "Enter at least one verb, like vcrun2022."))
         }
-        // Under -q annihilate wipes the prefix and its saves without asking, prefix= switches to
-        // another prefix, and options like --self-update change winetricks itself.
         if let refused = verbs.first(where: { $0 == "annihilate" || $0.hasPrefix("prefix=") || $0.hasPrefix("-") }) {
             throw StepFailure(step: step, detail: String(localized: "NotProton does not run \(refused) with Winetricks."))
         }
+        try refuseWhileSharedPrefixInUse(prefix, step: step)
+        try requireValidOwner(prefix, step: step)
         guard !PrefixStore.isInUse(prefix) else {
             throw StepFailure(step: step, detail: String(localized: "\(prefix.title) is running. Quit the game first."))
         }
         let loader = try readyLoader(step: step, prefix: prefix, runner: runner, flavor: flavor)
-
-        // cabextract comes from the runner's bin, which environment() puts on PATH.
-        var environment = environment(prefix: prefix, runner: runner, flavor: flavor)
+        var environment = try checkedEnvironment(prefix: prefix, runner: runner, flavor: flavor)
         environment["WINE"] = loader.path(percentEncoded: false)
-
         let log = prefix.root.appending(path: winetricksLogName)
         let status = try Shell.logged(
             "/bin/sh", [script.path(percentEncoded: false), "-q"] + verbs,
             environment: environment, to: log
         )
-        // Until the wineserver exits, the prefix still counts as in use.
         _ = try? Shell.run(layout(runner: runner, flavor: flavor).server.path(percentEncoded: false), ["-w"], environment: environment)
         guard status == 0 else {
             throw StepFailure(
@@ -319,15 +359,20 @@ enum PrefixTools {
         }
     }
 
-    static var runnableTypes: [UTType] {
-        ["exe", "msi", "bat", "cmd"].compactMap { UTType(filenameExtension: $0) }
+    private static func refuseWhileSharedPrefixInUse(_ prefix: WinePrefix, step: String) throws {
+        let root = try GameProfileStore.resolveRoot(for: prefix)
+        if root != prefix.pfx, PrefixStore.isInUse(prefix) {
+            throw StepFailure(step: step, detail: String(localized: "The shared prefix is in use. Quit its game before launching another helper."))
+        }
     }
 
-    static func reveal(_ prefix: WinePrefix) {
-        NSWorkspace.shared.selectFile(
-            prefix.pfx.path(percentEncoded: false),
-            inFileViewerRootedAtPath: prefix.root.path(percentEncoded: false)
-        )
+    private static func requireValidOwner(_ prefix: WinePrefix, step: String) throws {
+        do { _ = try GameProfileStore.resolveRoot(for: prefix) }
+        catch { throw StepFailure(step: step, detail: error.localizedDescription) }
+    }
+
+    static var runnableTypes: [UTType] {
+        ["exe", "msi", "bat", "cmd"].compactMap { UTType(filenameExtension: $0) }
     }
 
     static func hasLog(_ log: PrefixLog, for prefix: WinePrefix) -> Bool {
@@ -336,6 +381,13 @@ enum PrefixTools {
 
     static func open(_ log: PrefixLog, for prefix: WinePrefix) {
         NSWorkspace.shared.open(log.url(for: prefix))
+    }
+
+    static func reveal(_ prefix: WinePrefix) {
+        NSWorkspace.shared.selectFile(
+            prefix.pfx.path(percentEncoded: false),
+            inFileViewerRootedAtPath: prefix.root.path(percentEncoded: false)
+        )
     }
 
     static func reveal(at url: URL) {
@@ -352,6 +404,14 @@ enum PrefixTools {
     }
 
     static func delete(_ prefix: WinePrefix) throws {
+        guard !GameProfileStore.ownerReferenceExists(for: prefix),
+              !GameProfileStore.isReferenced(prefix) else {
+            throw StepFailure(step: String(localized: "Delete prefix"), detail: String(localized: "This prefix is shared. Remove its game profile references before deleting it."))
+        }
+        if GameProfileStore.isReferenced(prefix) {
+            let games = GameProfileStore.referencingGames(prefix).map(\.title).joined(separator: ", ")
+            throw StepFailure(step: String(localized: "Delete prefix"), detail: String(localized: "This prefix is shared by \(games). Remove those profile references first."))
+        }
         guard !PrefixStore.isInUse(prefix) else {
             throw StepFailure(
                 step: String(localized: "Delete prefix"),
@@ -360,6 +420,15 @@ enum PrefixTools {
         }
         try WriteRefused.catching(prefix.root) {
             try FileManager.default.removeItem(at: prefix.root)
+        }
+    }
+
+    static func refuseIfShared(_ prefix: WinePrefix, step: String) throws {
+        guard !GameProfileStore.ownerReferenceExists(for: prefix) else {
+            throw StepFailure(step: step, detail: String(localized: "This game uses a shared prefix. Rebuild its owner prefix instead."))
+        }
+        guard !GameProfileStore.isReferenced(prefix) else {
+            throw StepFailure(step: step, detail: String(localized: "This prefix is shared by another game and cannot be rebuilt."))
         }
     }
 }

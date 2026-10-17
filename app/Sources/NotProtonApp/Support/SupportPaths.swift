@@ -6,6 +6,9 @@ enum SupportPaths {
 
     static let supportDirName = "notproton"
     static let dylibName = "notproton.dylib"
+    static let gameIdentityName = "game-identity.dylib"
+    static let sessionCheckName = "sessioncheck"
+    static let gamePresentationName = "game-presentation"
 
     static var home: URL {
         URL(filePath: NSHomeDirectory())
@@ -33,6 +36,9 @@ enum SupportPaths {
     static var overlayShim: URL { support.appending(path: "overlay-shim.dylib") }
     static var iconmaker: URL { support.appending(path: "iconmaker") }
     static var appinfo: URL { support.appending(path: "appinfo") }
+    static var gameIdentity: URL { support.appending(path: gameIdentityName) }
+    static var sessionCheck: URL { support.appending(path: sessionCheckName) }
+    static var gamePresentation: URL { support.appending(path: gamePresentationName) }
 
     static var packageDownloads: URL {
         home.appending(path: "Library/Caches/\(supportDirName)/valve-packages")

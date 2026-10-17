@@ -27,6 +27,7 @@ extension PrefixTools {
         now: Date = .now,
         keepBackup: Bool = true
     ) throws -> URL? {
+        try refuseIfShared(prefix, step: "Recreate prefix")
         guard !PrefixStore.isInUse(prefix) else {
             throw StepFailure(
                 step: String(localized: "Recreate prefix"),
@@ -60,7 +61,7 @@ extension PrefixTools {
         defer { try? fm.removeItem(at: fresh) }
         try fm.createDirectory(at: fresh, withIntermediateDirectories: true)
 
-        var environment = environment(prefix: prefix, runner: runner, flavor: flavor)
+        var environment = try checkedEnvironment(prefix: prefix, runner: runner, flavor: flavor)
         environment["WINEPREFIX"] = fresh.path(percentEncoded: false)
         layOutProfile(in: fresh)
         _ = try Shell.check(loader.path(percentEncoded: false), ["wineboot", "--init"], environment: environment)
@@ -98,6 +99,10 @@ extension PrefixTools {
 
     @discardableResult
     static func backUp(_ prefix: WinePrefix, now: Date = .now) throws -> URL {
+        try refuseIfShared(prefix, step: "Back up prefix")
+        guard let resolved = try? GameProfileStore.resolveRoot(for: prefix) else {
+            throw StepFailure(step: "Back up prefix", detail: "The shared prefix owner is invalid.")
+        }
         guard !PrefixStore.isInUse(prefix) else {
             throw StepFailure(
                 step: String(localized: "Back up prefix"),
@@ -106,7 +111,7 @@ extension PrefixTools {
         }
 
         let fm = FileManager.default
-        guard fm.fileExists(atPath: prefix.pfx.path(percentEncoded: false)) else {
+        guard fm.fileExists(atPath: resolved.path(percentEncoded: false)) else {
             throw StepFailure(
                 step: String(localized: "Back up prefix"),
                 detail: String(localized: "\(prefix.title) does not appear to have a prefix to back up.")
@@ -115,7 +120,7 @@ extension PrefixTools {
 
         let slot = backupSlot(in: prefix.root, at: now)
         do {
-            try fm.copyItem(at: prefix.pfx, to: slot)
+            try fm.copyItem(at: resolved, to: slot)
         } catch {
             try? fm.removeItem(at: slot)
             throw error

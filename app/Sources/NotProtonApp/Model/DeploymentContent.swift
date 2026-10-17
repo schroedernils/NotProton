@@ -146,7 +146,10 @@ enum DeploymentContent {
     static func files(
         payload: InstallPayload.Located, bridgePayload: BridgePayload.Located,
         app: URL, bridge: URL, signatures: URL, fonts: URL, overlayShim: URL, iconmaker: URL, appinfo: URL,
-        compatTools: URL, tools: [InstalledTool], runners: URL
+        compatTools: URL, tools: [InstalledTool], runners: URL,
+        gameIdentity: URL = SupportPaths.gameIdentity,
+        sessionCheck: URL = SupportPaths.sessionCheck,
+        gamePresentation: URL = SupportPaths.gamePresentation
     ) -> [File] {
         var files = [
             File(source: payload.dylib, destination: SupportPaths.Steam.deployedDylib(inBundle: app),
@@ -154,6 +157,11 @@ enum DeploymentContent {
             File(source: payload.overlayShim, destination: overlayShim, name: "overlay-shim.dylib"),
             File(source: payload.iconmaker, destination: iconmaker, name: "iconmaker", executable: true),
             File(source: payload.appinfo, destination: appinfo, name: "appinfo", executable: true),
+            File(source: payload.gameIdentity, destination: gameIdentity, name: SupportPaths.gameIdentityName),
+            File(source: payload.sessionCheck, destination: sessionCheck,
+                 name: SupportPaths.sessionCheckName, executable: true),
+            File(source: payload.gamePresentation, destination: gamePresentation,
+                 name: SupportPaths.gamePresentationName, executable: true),
         ]
         files += payload.signatures.map {
             File(source: $0, destination: signatures.appending(path: $0.lastPathComponent),
